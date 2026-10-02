@@ -15,14 +15,3 @@ The resolved key SHALL be a regular file outside the resolved envdir, owned by e
 #### Scenario: Invalid reference or insecure key
 - **WHEN** an encrypted run or get has an invalid reference or key target
 - **THEN** exit is 111, run's child marker is absent and get's stdout is empty, and stderr contains no secret bytes
-
-### Requirement: Init creates an external key pointer safely
-Init SHALL remain a legacy command with its explicit positional DIRECTORY, with explicit global -d rejected before writes (exit 2). It SHALL create the public key, external private key (explicit destination or default adjacent DIRECTORY.key) and regular 0600 pointer containing a fully resolved absolute key path plus newline. Init SHALL refuse every preexisting key/public/pointer entry including dangling symlinks and reject destinations inside envdir. Failures SHALL not overwrite preexisting files and SHALL remove only newly created invocation artifacts.
-
-#### Scenario: Fresh init
-- **WHEN** legacy init completes for a new envdir
-- **THEN** set -c followed by run with that envdir selected via global -d decrypts via the created pointer
-
-#### Scenario: Collision preflight
-- **WHEN** a pointer already exists including a dangling symlink
-- **THEN** init fails before creating keys and preserves that entry

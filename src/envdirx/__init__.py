@@ -203,27 +203,6 @@ def _refuse_existing(*paths: Path) -> None:
             raise ValueError(f"already exists; refusing to overwrite: {path}")
 
 
-def _init(directory: Path, override: str | None) -> None:
-    """Legacy init: adjacent default key and a regular text pointer."""
-    envdir = directory.resolve(strict=True)
-    if override:
-        key = _home(override)
-    else:
-        absolute = Path(os.path.abspath(directory))
-        if not absolute.name:
-            raise ValueError(f"cannot derive default key path for {directory}; use --key")
-        key = absolute.with_name(absolute.name + ".key")
-    pub, pointer = directory / PUB, directory / POINTER
-    _refuse_existing(pub, pointer, key)
-    key = _destination(key, envdir)
-    secret, public = _raw(X25519PrivateKey.generate())
-    _write_all((
-        (key, lambda path: _create(path, secret, 0o600)),
-        (pointer, lambda path: _create(path, (str(key) + "\n").encode("utf-8"), 0o600)),
-        (pub, lambda path: _create(path, public, 0o644)),
-    ))
-
-
 def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
     """Write an external key (file or fingerprint-named), public key and absolute symlink pointer."""
     envdir = directory.resolve(strict=True)
@@ -314,8 +293,7 @@ relative to the current directory; only mkdir creates it.
   envdirx [-d DIR] set [-c] NAME          < value
   envdirx [-d DIR] get [--key KEY] NAME
   envdirx [-d DIR] encrypt [NAME ...]
-  envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]
-  envdirx init [--key KEY] DIRECTORY      (legacy; rejects -d)"""
+  envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]"""
 
 KEY_HELP = """\
 An encrypted entry needs the private key: --key when given (relative to the
@@ -354,14 +332,6 @@ DIRECTORY/.envdirx.pub (0644); and DIRECTORY/.envdirx.key, a symlink to the
 key's resolved absolute path. Relative paths use the current directory and a
 leading ~/ expands. Existing files are never overwritten (no force option)."""
 
-INIT_HELP = """\
-Legacy command; keeps its positional DIRECTORY and rejects the global -d.
-Writes DIRECTORY/.envdirx.pub (0644), the private key (0600) at --key or
-DIRECTORY.key beside the directory, and DIRECTORY/.envdirx.key (0600), a
-regular file containing the key's resolved absolute path. Parent directories
-are not created; existing files are never overwritten. Prefer mkdir + keygen."""
-
-
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(prog="envdirx", description=DESCRIPTION, formatter_class=text)
@@ -373,7 +343,6 @@ def main() -> None:
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
     encrypt = sub.add_parser("encrypt", help="encrypt existing plaintext entries in place (public key only)")
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
-    init = sub.add_parser("init", help="legacy: create keys and a text pointer for DIRECTORY", description=INIT_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group(required=True)
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
     destination.add_argument("-K", "--key-dir", help="existing directory for <sha256>.key")
@@ -384,15 +353,8 @@ def main() -> None:
     encrypt.add_argument("names", nargs="*", help="entries to encrypt; default: all plaintext entries")
     run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
-    init.add_argument("--key", help="private key destination outside DIRECTORY; default: DIRECTORY.key beside it")
-    init.add_argument("directory", type=Path)
     args = parser.parse_args()
-    if args.action == "init":
-        if args.envdir is not None:
-            init.error("init takes a positional DIRECTORY; -d/--directory is not allowed")
-        directory = args.directory
-    else:
-        directory = args.envdir if args.envdir is not None else Path(DEFAULT_DIRECTORY)
+    directory = args.envdir if args.envdir is not None else Path(DEFAULT_DIRECTORY)
     if args.action == "run" and (args.command[:1] != ["--"] or len(args.command) < 2):
         run.error("expected -- COMMAND [ARGS...]")
     try:
@@ -401,9 +363,7 @@ def main() -> None:
             return
         if not directory.is_dir():
             raise ValueError(f"not a directory: {directory}")
-        if args.action == "init":
-            _init(directory, args.key)
-        elif args.action == "keygen":
+        if args.action == "keygen":
             _keygen(directory, args.key, args.key_dir)
         elif args.action == "encrypt":
             public = _public(directory)
