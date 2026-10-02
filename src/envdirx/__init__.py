@@ -1,6 +1,7 @@
-"""Encrypted DJB envdir files. Ciphertext remains in the envdir; keys do not."""
+"""DJB envdir files, plaintext or encrypted. Ciphertext remains in the envdir; keys do not."""
 
 import argparse
+import hashlib
 import os
 import stat
 import sys
@@ -17,6 +18,8 @@ from cryptography.hazmat.primitives import serialization
 MAGIC = b"envdirx:v1:\n"
 PUB = ".envdirx.pub"
 POINTER = ".envdirx.key"
+RESERVED = b"envdirx:"  # every envdirx format starts with this; plaintext may not
+DEFAULT_DIRECTORY = ".envs"
 
 
 def _home(text: str) -> Path:
@@ -157,7 +160,51 @@ def _create(path: Path, data: bytes, mode: int) -> None:
         raise
 
 
+def _destination(key: Path, envdir: Path) -> Path:
+    """Return a fully resolved key destination outside ENVDIR whose parent exists."""
+    if key.name in ("", ".", ".."):
+        raise ValueError(f"invalid private key path: {key}")
+    parent = key.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise ValueError(f"not a directory: {key.parent}")
+    key = parent / key.name
+    if _inside(key, envdir):
+        raise ValueError(f"private key must be outside the envdir: {key}")
+    if os.path.lexists(key):
+        raise ValueError(f"already exists; refusing to overwrite: {key}")
+    return key
+
+
+def _raw(private: X25519PrivateKey) -> tuple[bytes, bytes]:
+    secret = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    return secret, private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def _link(path: Path, target: Path) -> None:
+    os.symlink(target, path)  # fails if PATH exists, like O_EXCL
+
+
+def _write_all(steps) -> None:
+    """Run (path, writer) steps in order; on failure remove only what was created."""
+    created = []
+    try:
+        for path, write in steps:
+            write(path)
+            created.append(path)
+    except BaseException:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _refuse_existing(*paths: Path) -> None:
+    for path in paths:
+        if os.path.lexists(path):
+            raise ValueError(f"already exists; refusing to overwrite: {path}")
+
+
 def _init(directory: Path, override: str | None) -> None:
+    """Legacy init: adjacent default key and a regular text pointer."""
     envdir = directory.resolve(strict=True)
     if override:
         key = _home(override)
@@ -167,51 +214,88 @@ def _init(directory: Path, override: str | None) -> None:
             raise ValueError(f"cannot derive default key path for {directory}; use --key")
         key = absolute.with_name(absolute.name + ".key")
     pub, pointer = directory / PUB, directory / POINTER
-    for path in (pub, pointer, key):
-        if os.path.lexists(path):
-            raise ValueError(f"already exists; refusing to overwrite: {path}")
-    if key.name in ("", ".", ".."):
-        raise ValueError(f"invalid private key path: {key}")
-    parent = key.parent.resolve(strict=True)
-    if not parent.is_dir():
-        raise ValueError(f"not a directory: {key.parent}")
-    key = parent / key.name
-    if _inside(key, envdir):
-        raise ValueError(f"private key must be outside the envdir: {key}")
-    reference = (str(key) + "\n").encode("utf-8")
-    private = X25519PrivateKey.generate()
-    created = []
-    try:
-        for path, data, mode in (
-            (key, private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption()), 0o600),
-            (pointer, reference, 0o600),
-            (pub, private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw), 0o644),
-        ):
-            _create(path, data, mode)
-            created.append(path)
-    except BaseException:
-        for path in reversed(created):
-            path.unlink(missing_ok=True)
-        raise
+    _refuse_existing(pub, pointer, key)
+    key = _destination(key, envdir)
+    secret, public = _raw(X25519PrivateKey.generate())
+    _write_all((
+        (key, lambda path: _create(path, secret, 0o600)),
+        (pointer, lambda path: _create(path, (str(key) + "\n").encode("utf-8"), 0o600)),
+        (pub, lambda path: _create(path, public, 0o644)),
+    ))
+
+
+def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
+    """Write an external key (file or fingerprint-named), public key and absolute symlink pointer."""
+    envdir = directory.resolve(strict=True)
+    pub, pointer = directory / PUB, directory / POINTER
+    _refuse_existing(pub, pointer)
+    secret, public = _raw(X25519PrivateKey.generate())
+    if key_dir is not None:
+        folder = _home(key_dir)
+        if not folder.is_dir():
+            raise ValueError(f"key directory must be an existing directory: {folder}")
+        destination = folder / (hashlib.sha256(public).hexdigest() + ".key")
+    else:
+        destination = _home(key)
+        _refuse_existing(destination)  # -k names a file, even when a directory already sits there
+    destination = _destination(destination, envdir)
+    _write_all((
+        (destination, lambda path: _create(path, secret, 0o600)),
+        (pub, lambda path: _create(path, public, 0o644)),
+        (pointer, lambda path: _link(path, destination)),
+    ))
+
+
+def _mkdir(directory: Path) -> None:
+    if directory.is_dir():
+        return  # existing directories are left untouched (no chmod)
+    if os.path.lexists(directory):
+        raise ValueError(f"not a directory: {directory}")
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    os.mkdir(directory, 0o700)
+    os.chmod(directory, 0o700)  # umask must not loosen or tighten the new envdir
+
+
+def _value(path: Path, private) -> bytes:
+    """Return the stored plaintext bytes of an entry; PRIVATE() supplies the key on demand."""
+    data = path.read_bytes()
+    if data.startswith(MAGIC):
+        return _decrypt(data, path.name, private())
+    if data.startswith(RESERVED):
+        raise ValueError(f"unsupported ciphertext format: {path.name}")
+    return data
+
+
+def _get(directory: Path, key: str | None, name: str) -> bytes:
+    _name(name)
+    path = directory / name
+    _regular(path)
+    return _value(path, lambda: _private(directory, key))
+
+
+def _set(directory: Path, name: str, data: bytes, encrypt: bool) -> None:
+    _name(name)
+    path = directory / name
+    if path.exists() or path.is_symlink():
+        _regular(path)
+    if encrypt:
+        data = _encrypt(data, name, _public(directory))
+    elif data.startswith(RESERVED):
+        raise ValueError(f"plaintext must not start with the reserved {RESERVED.decode()} prefix; use set -c")
+    _atomic(path, data, 0o600)
 
 
 def _run(directory: Path, key: str | None, command: list[str]) -> None:
-    if not command:
-        raise ValueError("missing command")
-    if command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise ValueError("missing command")
     env = os.environ.copy()
-    private = None
+    keys = []
+
+    def private():
+        if not keys:
+            keys.append(_private(directory, key))
+        return keys[0]
+
     for path in _files(directory):
-        data = path.read_bytes()
-        if data.startswith(MAGIC):
-            if private is None:
-                private = _private(directory, key)
-            data = _decrypt(data, path.name, private)
-        elif data.startswith(b"envdirx:"):
-            raise ValueError(f"unsupported ciphertext format: {path.name}")
+        data = _value(path, private)
         if not data:
             env.pop(path.name, None)
         else:
@@ -220,46 +304,107 @@ def _run(directory: Path, key: str | None, command: list[str]) -> None:
     os.execvpe(command[0], command, env)
 
 
+DESCRIPTION = """\
+Store DJB envdir entries as plaintext or encrypted files and run commands with
+them. -d/--directory goes BEFORE the subcommand and defaults to ./.envs
+relative to the current directory; only mkdir creates it.
+
+  envdirx [-d DIR] mkdir
+  envdirx [-d DIR] keygen (-k KEYFILE | -K KEYDIR)
+  envdirx [-d DIR] set [-c] NAME          < value
+  envdirx [-d DIR] get [--key KEY] NAME
+  envdirx [-d DIR] encrypt [NAME ...]
+  envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]
+  envdirx init [--key KEY] DIRECTORY      (legacy; rejects -d)"""
+
+KEY_HELP = """\
+An encrypted entry needs the private key: --key when given (relative to the
+current directory, leading ~/ expanded), otherwise DIRECTORY/.envdirx.key,
+either a symlink or a regular file holding one path line; relative targets
+resolve against DIRECTORY and a leading ~/ expands in text pointers only.
+There is no fallback to an adjacent key. The resolved key must be a regular
+file outside DIRECTORY, owned by you, with mode 0600 (no group/other bits).
+Plaintext entries need no key or pointer."""
+
 RUN_HELP = """\
-The private key comes from --key when given (which must precede DIRECTORY,
-because everything after DIRECTORY is the command). Otherwise it comes from
-DIRECTORY/.envdirx.key, either a symlink or a regular file holding one path
-line; relative targets resolve against DIRECTORY and a leading ~/ expands in
-text pointers only. There is no fallback to DIRECTORY.key. The resolved key
-must be a regular file outside DIRECTORY, owned by you, with mode 0600 (no
-group/other bits). Plaintext-only envdirs need no key or pointer."""
+Runs COMMAND with the envdir applied (first line, trailing blanks trimmed,
+NUL becomes newline, empty file unsets). The literal -- separator is
+required, and --key must precede it; everything after -- belongs to COMMAND.
+
+""" + KEY_HELP
+
+GET_HELP = """\
+Writes the stored value to stdout exactly: the plaintext bytes, or the
+decrypted original bytes. No newline is added and no envdir trimming is
+applied. This deliberately discloses a secret; nothing is written to stdout
+on failure.
+
+""" + KEY_HELP
+
+SET_HELP = """\
+Reads the value from stdin and stores it atomically (mode 0600). Without -c
+the exact bytes are stored as plaintext and no key is read; values starting
+with the reserved "envdirx:" prefix are refused, store them with -c. With -c
+the value is encrypted using only DIRECTORY/.envdirx.pub."""
+
+KEYGEN_HELP = """\
+Creates a new X25519 key pair: the private key (0600) outside DIRECTORY at
+-k KEYFILE, or in the existing -K KEYDIR named <sha256 of public key>.key;
+DIRECTORY/.envdirx.pub (0644); and DIRECTORY/.envdirx.key, a symlink to the
+key's resolved absolute path. Relative paths use the current directory and a
+leading ~/ expands. Existing files are never overwritten (no force option)."""
 
 INIT_HELP = """\
+Legacy command; keeps its positional DIRECTORY and rejects the global -d.
 Writes DIRECTORY/.envdirx.pub (0644), the private key (0600) at --key or
-DIRECTORY.key beside the directory, and DIRECTORY/.envdirx.key (0600)
-containing the key's resolved absolute path. Parent directories are not
-created; existing files are never overwritten."""
+DIRECTORY.key beside the directory, and DIRECTORY/.envdirx.key (0600), a
+regular file containing the key's resolved absolute path. Parent directories
+are not created; existing files are never overwritten. Prefer mkdir + keygen."""
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Encrypt DJB envdir entries without plaintext at runtime")
-    sub = parser.add_subparsers(dest="action", required=True)
     text = argparse.RawDescriptionHelpFormatter
-    init = sub.add_parser("init", help="create a new key pair and key pointer for an existing directory", description=INIT_HELP, formatter_class=text)
-    encrypt = sub.add_parser("encrypt", help="encrypt existing plaintext entries in place")
-    set_cmd = sub.add_parser("set", help="encrypt stdin as one entry (no plaintext file)")
+    parser = argparse.ArgumentParser(prog="envdirx", description=DESCRIPTION, formatter_class=text)
+    parser.add_argument("-d", "--directory", dest="envdir", type=Path, metavar="DIRECTORY", help="envdir (default: ./.envs); must precede the subcommand")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("mkdir", help="create the envdir (mode 0700) and missing parents")
+    keygen = sub.add_parser("keygen", help="create a key pair and .envdirx.key symlink", description=KEYGEN_HELP, formatter_class=text)
+    set_cmd = sub.add_parser("set", help="store stdin as one entry (plaintext by default)", description=SET_HELP, formatter_class=text)
+    get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
+    encrypt = sub.add_parser("encrypt", help="encrypt existing plaintext entries in place (public key only)")
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
-    init.add_argument("--key", help="private key destination outside DIRECTORY; default: DIRECTORY.key beside it")
-    for cmd in (encrypt, set_cmd):
-        cmd.add_argument("--key", help="unused; kept for compatibility (only the public key is needed)")
-    run.add_argument("--key", help="private key to use instead of DIRECTORY/.envdirx.key; must precede DIRECTORY")
-    for cmd in (init, encrypt, set_cmd, run):
-        cmd.add_argument("directory", type=Path)
-    encrypt.add_argument("names", nargs="*", help="entries to encrypt; default: all plaintext entries")
+    init = sub.add_parser("init", help="legacy: create keys and a text pointer for DIRECTORY", description=INIT_HELP, formatter_class=text)
+    destination = keygen.add_mutually_exclusive_group(required=True)
+    destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
+    destination.add_argument("-K", "--key-dir", help="existing directory for <sha256>.key")
+    set_cmd.add_argument("-c", "--encrypt", action="store_true", help="encrypt with .envdirx.pub instead of storing plaintext")
     set_cmd.add_argument("name")
-    run.add_argument("command", nargs=argparse.REMAINDER)
+    get.add_argument("--key", help="private key to use instead of .envdirx.key")
+    get.add_argument("name")
+    encrypt.add_argument("names", nargs="*", help="entries to encrypt; default: all plaintext entries")
+    run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
+    run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
+    init.add_argument("--key", help="private key destination outside DIRECTORY; default: DIRECTORY.key beside it")
+    init.add_argument("directory", type=Path)
     args = parser.parse_args()
-    directory = args.directory
+    if args.action == "init":
+        if args.envdir is not None:
+            init.error("init takes a positional DIRECTORY; -d/--directory is not allowed")
+        directory = args.directory
+    else:
+        directory = args.envdir if args.envdir is not None else Path(DEFAULT_DIRECTORY)
+    if args.action == "run" and (args.command[:1] != ["--"] or len(args.command) < 2):
+        run.error("expected -- COMMAND [ARGS...]")
     try:
+        if args.action == "mkdir":
+            _mkdir(directory)
+            return
         if not directory.is_dir():
             raise ValueError(f"not a directory: {directory}")
         if args.action == "init":
             _init(directory, args.key)
+        elif args.action == "keygen":
+            _keygen(directory, args.key, args.key_dir)
         elif args.action == "encrypt":
             public = _public(directory)
             paths = [directory / name for name in args.names] if args.names else list(_files(directory))
@@ -273,13 +418,13 @@ def main() -> None:
                     continue
                 _atomic(path, _encrypt(data, path.name, public), 0o600)
         elif args.action == "set":
-            _name(args.name)
-            path = directory / args.name
-            if path.exists() or path.is_symlink():
-                _regular(path)
-            _atomic(path, _encrypt(sys.stdin.buffer.read(), args.name, _public(directory)), 0o600)
+            _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
+        elif args.action == "get":
+            value = _get(directory, args.key, args.name)
+            sys.stdout.buffer.write(value)
+            sys.stdout.buffer.flush()
         else:
-            _run(directory, args.key, args.command)
+            _run(directory, args.key, args.command[1:])
     except (OSError, ValueError) as exc:
         parser.exit(111, f"envdirx: {exc}\n")
 
