@@ -1,6 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Explicit in-place transformation selection
+Raw NAME arguments SHALL pass existing set/get name validation before path construction; invalid path traversal or dot metadata names SHALL fail 111 with no writes. Explicit names SHALL retain argument order.
 Encrypt and decrypt SHALL require either one or more unique entry names or --all, mutually exclusive. Missing/combined/duplicate selectors SHALL fail parsing exit 2 before key/directory reads or writes. Encrypt SHALL convert plaintext to v1 ciphertext with regular public key only; decrypt SHALL restore authenticated exact plaintext bytes with validated external private key and optional --key override. Explicit target already in desired state SHALL fail 111; --all SHALL skip it. Dotfiles SHALL remain untouched. Empty/no-work batches SHALL succeed without key lookup. Unknown/malformed reserved envdirx: envelopes SHALL fail 111 in either operation. Decrypt SHALL reject restored reserved-prefix plaintext before writes, preserving ciphertext so run/get never misclassify restored files. Get remains available for those original bytes.
 
 #### Scenario: Reversible selected values
@@ -10,6 +11,10 @@ Encrypt and decrypt SHALL require either one or more unique entry names or --all
 #### Scenario: Explicit all and no-op
 - **WHEN** --all selects a mixed or already-converted directory
 - **THEN** only entries needing conversion change, and a no-work batch needs no key
+
+#### Scenario: Unsafe raw names
+- **WHEN** ../X, an absolute path, .envdirx.pub or .envdirx.key is supplied to encrypt/decrypt
+- **THEN** exit is 111 and every envdir and external file remains unchanged
 
 #### Scenario: Invalid selection
 - **WHEN** no targets, duplicate names or --all with names are provided
