@@ -120,7 +120,7 @@ class EnvdirxTest(unittest.TestCase):
         # Regular-file text pointers keep working alongside keygen's symlinks.
         fx.text_pointer()
         self.assertEqual((directory / ".envdirx.key").read_bytes(), str(key).encode() + b"\n")
-        self.assertEqual(fx.on("encrypt").returncode, 0)
+        self.assertEqual(fx.on("encrypt", "--all").returncode, 0)
         self.assertNotIn(b"top-secret", (directory / "TOKEN").read_bytes())
         result = fx.on("run", "--", *SHOW)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -322,9 +322,16 @@ class EnvdirxTest(unittest.TestCase):
     def test_help_describes_grammar(self):
         fx = Fixture(self)
         main_help = fx.call("--help").stdout
-        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen (-k KEYFILE | -K KEYDIR)", b"set [-c] NAME", b"run [--key KEY] -- COMMAND"):
+        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen (-k KEYFILE | -K KEYDIR)", b"set [-c] NAME", b"run [--key KEY] -- COMMAND", b"encrypt (NAME [NAME ...] | --all)", b"decrypt [--key KEY] (NAME [NAME ...] | --all)"):
             self.assertIn(text, main_help)
         self.assertNotIn(b"init", main_help)
+        self.assertNotIn(b"encrypt [NAME ...]", main_help)
+        encrypt_help = fx.call("encrypt", "--help").stdout
+        self.assertIn(b"(NAME [NAME ...] | --all)", encrypt_help)
+        self.assertIn(b"no\nprivate key is read", encrypt_help)
+        decrypt_help = fx.call("decrypt", "--help").stdout
+        for text in (b"[--key KEY] (NAME [NAME ...] | --all)", b"plaintext", b'"envdirx:"', b"not a transaction", b".envdirx.key"):
+            self.assertIn(text, decrypt_help)
         self.assertNotIn(b"legacy", main_help.lower())
         run_help = fx.call("run", "--help").stdout
         self.assertIn(b"must precede it", run_help)
@@ -347,8 +354,15 @@ class EnvdirxTest(unittest.TestCase):
         for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`set -c`", "`init` は削除した"):
             self.assertIn(text, readme)
         self.assertNotIn("envdirx init", readme)
+        for text in ("encrypt (NAME [NAME ...] \\| --all)", "decrypt [--key KEY] (NAME [NAME ...] \\| --all)", "encrypt --all", 'decrypt --key "$PWD/app.env.key" --all', "意図的に秘密を平文のままディスクへ書く"):
+            self.assertIn(text, readme)
+        self.assertNotIn("encrypt [NAME ...]`", readme)
+        self.assertIsNone(re.search(r"envdirx(?: -d \S+)? encrypt\s*$", readme, re.M), "no implicit-all encrypt")
         skill = (ROOT / ".agents" / "skills" / "envdirx-operations" / "SKILL.md").read_text()
         self.assertIn("stores **plaintext** by default", skill)
+        for text in ("encrypt (NAME ... | --all)", "decrypt [--key K] (NAME ... | --all)", "plaintext on disk"):
+            self.assertIn(text, skill)
+        self.assertNotIn("encrypt [NAME ...]", skill)
         for block in blocks:
             with self.subTest(block=block.splitlines()[0]):
                 fx = Fixture(self)
@@ -366,6 +380,273 @@ class EnvdirxTest(unittest.TestCase):
                 env = {**fx.env, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
                 result = subprocess.run(["sh", "-c", prelude + block], cwd=fx.root, env=env, capture_output=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr.decode() + block)
+
+
+class TransformTest(unittest.TestCase):
+    """encrypt/decrypt: explicit selection, preflight validation, per-entry atomic writes."""
+
+    VALUES = {"BIN": bytes(range(256)), "LINES": b"one \nnul\x00two\n", "EMPTY": b"", "SPACED": b"  spaced \t\n"}
+
+    def setup(self, fx, **values):
+        _keygen(fx, "-k", fx.root / "svc.key")
+        for name, value in (values or self.VALUES).items():
+            path = fx.directory / name
+            path.write_bytes(value)
+            path.chmod(0o644)
+        return fx.root / "svc.key"
+
+    def ok(self, fx, *args, **kw):
+        result = fx.on(*args, **kw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        return result
+
+    def fails(self, fx, *args, code=111, **kw):
+        """ACTION fails with CODE, writes nothing anywhere and discloses nothing."""
+        before = fx.snapshot()
+        result = fx.on(*args, **kw)
+        self.assertEqual(result.returncode, code, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(fx.snapshot(), before)
+        for value in (SECRET, *(v for v in self.VALUES.values() if len(v) > 4)):
+            self.assertNotIn(value, result.stderr)
+        for key in fx.root.rglob("*.key"):
+            if key.is_file() and not key.is_symlink() and key.stat().st_size == 32:
+                self.assertNotIn(key.read_bytes(), result.stderr)
+        return result
+
+    def dotfiles(self, fx):
+        return {p.name: (os.readlink(p) if p.is_symlink() else p.read_bytes()) for p in fx.directory.iterdir() if p.name.startswith(".")}
+
+    def test_selection_is_required_unique_and_exclusive(self):
+        fx = Fixture(self)
+        self.setup(fx)
+        self.ok(fx, "encrypt", "BIN")
+        # Broken key material proves parsing fails before any key or directory read.
+        (fx.directory / ".envdirx.key").unlink()
+        (fx.directory / ".envdirx.key").symlink_to("nowhere")
+        for action in ("encrypt", "decrypt"):
+            for args in ((), ("--all", "LINES"), ("LINES", "--all"), ("LINES", "LINES"), ("BIN", "LINES", "BIN"), ("--all", "--all", "LINES")):
+                with self.subTest(action=action, args=args):
+                    result = self.fails(fx, action, *args, code=2)
+                    self.assertIn(b"usage:", result.stderr)
+        self.fails(fx, "decrypt", "--key", fx.root / "svc.key", code=2)
+        self.fails(fx, "encrypt", "--key", fx.root / "svc.key", "LINES", code=2)
+        missing = fx.root / "missing"
+        for action in ("encrypt", "decrypt"):
+            self.fails(fx, action, directory=missing, code=2)
+            self.assertFalse(os.path.lexists(missing))
+
+    def test_named_and_all_roundtrip_exact_bytes(self):
+        fx = Fixture(self)
+        self.setup(fx, **self.VALUES, UNRELATED=b"unrelated")
+        meta = self.dotfiles(fx)
+        self.ok(fx, "encrypt", "LINES", "BIN", "EMPTY")
+        for name in ("LINES", "BIN", "EMPTY"):
+            stored = (fx.directory / name).read_bytes()
+            self.assertTrue(stored.startswith(b"envdirx:v1:\n"), name)
+            if self.VALUES[name]:
+                self.assertNotIn(self.VALUES[name], stored)
+            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o600)
+        for name in ("SPACED", "UNRELATED"):
+            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o644)
+        self.assertEqual((fx.directory / "UNRELATED").read_bytes(), b"unrelated")
+        self.ok(fx, "decrypt", "EMPTY", "BIN")
+        for name in ("EMPTY", "BIN"):
+            self.assertEqual((fx.directory / name).read_bytes(), self.VALUES[name])
+            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o600)
+        self.assertTrue((fx.directory / "LINES").read_bytes().startswith(b"envdirx:v1:\n"))
+        self.ok(fx, "encrypt", "--all")  # skips the already encrypted LINES
+        for name in (*self.VALUES, "UNRELATED"):
+            self.assertTrue((fx.directory / name).read_bytes().startswith(b"envdirx:v1:\n"), name)
+        self.assertEqual(fx.on("get", "LINES").stdout, self.VALUES["LINES"])
+        self.ok(fx, "decrypt", "--all")
+        for name, value in {**self.VALUES, "UNRELATED": b"unrelated"}.items():
+            self.assertEqual((fx.directory / name).read_bytes(), value, name)
+            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.dotfiles(fx), meta)
+
+    def test_default_and_explicit_directory_selection(self):
+        fx = Fixture(self)
+        self.assertEqual(fx.call("mkdir").returncode, 0)
+        self.assertEqual(fx.call("keygen", "-k", fx.root / "default.key").returncode, 0)
+        self.assertEqual(fx.call("set", "-c", "AAA", input=SECRET).returncode, 0)
+        self.setup(fx, AAA=b"explicit")
+        self.ok(fx, "encrypt", "AAA")
+        explicit = (fx.directory / "AAA").read_bytes()
+        result = fx.call("decrypt", "AAA")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((fx.root / ".envs" / "AAA").read_bytes(), SECRET)
+        self.assertEqual((fx.directory / "AAA").read_bytes(), explicit)
+        self.ok(fx, "decrypt", "AAA")
+        self.assertEqual((fx.directory / "AAA").read_bytes(), b"explicit")
+
+    def test_encrypt_needs_only_public_and_decrypt_only_private(self):
+        fx = Fixture(self)
+        key = self.setup(fx, TOKEN=SECRET)
+        hidden = fx.root / "keys" / "hidden.key"
+        hidden.parent.mkdir()
+        key.rename(hidden)
+        (fx.directory / ".envdirx.key").unlink()
+        self.ok(fx, "encrypt", "TOKEN")
+        (fx.directory / ".envdirx.pub").unlink()
+        # Missing pointer fails closed; explicit --key (cwd-relative or ~/) overrides.
+        self.assertIn(b"missing key pointer", self.fails(fx, "decrypt", "TOKEN").stderr)
+        fx.link_pointer("missing.key")
+        self.fails(fx, "decrypt", "--all")
+        fx.write_pointer(b"\xff\xfe")
+        self.fails(fx, "decrypt", "TOKEN")
+        result = fx.call("-d", "service", "decrypt", "--key", "keys/hidden.key", "TOKEN", cwd=fx.root)
+        self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET)
+        # Encrypting again now needs the public key that was removed.
+        self.fails(fx, "encrypt", "TOKEN")
+        (fx.directory / ".envdirx.pub").write_bytes(_public_of(hidden))
+        self.ok(fx, "encrypt", "TOKEN")
+        hidden.rename(fx.home / "svc.key")
+        self.ok(fx, "decrypt", "--key", "~/svc.key", "--all")
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET)
+
+    def test_invalid_keys_preserve_batch(self):
+        fx = Fixture(self)
+        key = self.setup(fx, AAA=b"a-value", TOKEN=SECRET)
+        self.ok(fx, "encrypt", "--all")
+        good = key.read_bytes()
+        key.chmod(0o640)
+        self.assertIn(b"0600", self.fails(fx, "decrypt", "--all").stderr)
+        key.chmod(0o600)
+        key.write_bytes(os.urandom(32))
+        self.assertIn(b"decryption failed", self.fails(fx, "decrypt", "AAA", "TOKEN").stderr)
+        key.write_bytes(b"short")
+        self.fails(fx, "decrypt", "--all")
+        key.write_bytes(good)
+        inner = fx.directory / ".private"
+        inner.write_bytes(good)
+        inner.chmod(0o600)
+        self.assertIn(b"outside the envdir", self.fails(fx, "decrypt", "--key", inner, "--all").stderr)
+        self.ok(fx, "decrypt", "--all")
+
+    def test_no_work_needs_no_key(self):
+        fx = Fixture(self)
+        for action in ("encrypt", "decrypt"):
+            self.ok(fx, action, "--all")  # empty envdir, no key material at all
+        (fx.directory / ".hidden").write_bytes(b"envdirx:v9:\nignored dotfile")
+        (fx.directory / "PLAIN").write_bytes(b"plain")
+        fx.link_pointer("nowhere")
+        self.ok(fx, "decrypt", "--all")
+        self.assertEqual((fx.directory / "PLAIN").read_bytes(), b"plain")
+        fx2 = Fixture(self)
+        self.setup(fx2, TOKEN=SECRET)
+        self.ok(fx2, "encrypt", "--all")
+        cipher = (fx2.directory / "TOKEN").read_bytes()
+        (fx2.directory / ".envdirx.pub").unlink()
+        self.ok(fx2, "encrypt", "--all")
+        self.assertEqual((fx2.directory / "TOKEN").read_bytes(), cipher)
+
+    def test_explicit_target_state_errors(self):
+        fx = Fixture(self)
+        self.setup(fx, PLAIN=b"plain", TOKEN=SECRET)
+        self.ok(fx, "encrypt", "TOKEN")
+        self.assertIn(b"already encrypted: TOKEN", self.fails(fx, "encrypt", "PLAIN", "TOKEN").stderr)
+        self.assertIn(b"already decrypted: PLAIN", self.fails(fx, "decrypt", "TOKEN", "PLAIN").stderr)
+
+    def test_unsafe_raw_names_fail_without_writes(self):
+        fx = Fixture(self)
+        self.setup(fx, AAA=b"a-value")
+        (fx.root / "X").write_bytes(b"outside")
+        for name in ("../X", str(fx.root / "X"), ".envdirx.pub", ".envdirx.key", "A=B", "", ".", "..", "sub/AAA", "../service/AAA"):
+            for action in ("encrypt", "decrypt"):
+                with self.subTest(action=action, name=name):
+                    result = self.fails(fx, action, "AAA", name)
+                    self.assertIn(b"invalid environment variable name", result.stderr)
+
+    def test_invalid_entries_fail_whole_batch(self):
+        fx = Fixture(self)
+        self.setup(fx, AAA=b"a-value", TOKEN=SECRET)
+        target = fx.root / "target"
+        target.write_bytes(b"outside")
+        self.ok(fx, "encrypt", "--all")
+        cipher = (fx.directory / "TOKEN").read_bytes()
+        tampered = bytearray(cipher)
+        tampered[-1] ^= 1
+        corrupt = {
+            "tampered": bytes(tampered),
+            "truncated": cipher[:40],
+            "short": b"envdirx:v1:\nshort",
+            "wrong name": cipher,
+            "unsupported": b"envdirx:v2:\nx",
+            "reserved only": b"envdirx:",
+        }
+        for label, data in corrupt.items():
+            with self.subTest(label=label):
+                (fx.directory / "ZZZ").write_bytes(data)
+                self.fails(fx, "decrypt", "--all")
+                self.fails(fx, "decrypt", "AAA", "ZZZ")
+        for label, make in (("symlink", lambda p: p.symlink_to(target)), ("dangling", lambda p: p.symlink_to("nowhere")), ("directory", os.mkdir)):
+            with self.subTest(label=label):
+                (fx.directory / "ZZZ").unlink()
+                make(fx.directory / "ZZZ")
+                self.assertIn(b"not a regular file", self.fails(fx, "decrypt", "--all").stderr)
+                self.fails(fx, "decrypt", "AAA", "ZZZ")
+                if label == "directory":
+                    (fx.directory / "ZZZ").rmdir()
+                    (fx.directory / "ZZZ").write_bytes(b"")
+        (fx.directory / "ZZZ").unlink()
+        self.fails(fx, "decrypt", "AAA", "MISSING")
+        self.ok(fx, "decrypt", "--all")
+        # Encrypt validates the whole batch the same way.
+        for label, make in (("unsupported", lambda p: p.write_bytes(b"envdirx:v9:\nx")), ("symlink", lambda p: p.symlink_to(target)), ("directory", os.mkdir)):
+            with self.subTest(encrypt=label):
+                make(fx.directory / "ZZZ")
+                self.fails(fx, "encrypt", "--all")
+                self.fails(fx, "encrypt", "AAA", "ZZZ")
+                (fx.directory / "ZZZ").rmdir() if label == "directory" else (fx.directory / "ZZZ").unlink()
+        self.fails(fx, "encrypt", "AAA", "MISSING")
+        self.assertEqual(target.read_bytes(), b"outside")
+
+    def test_reserved_original_plaintext_stays_encrypted(self):
+        fx = Fixture(self)
+        self.setup(fx, TOKEN=SECRET)
+        self.assertEqual(fx.on("set", "-c", "AAA", input=b"envdirx:v1:\nlooks-encrypted").returncode, 0)
+        self.ok(fx, "encrypt", "TOKEN")
+        for args in (("--all",), ("TOKEN", "AAA"), ("AAA",)):
+            with self.subTest(args=args):
+                result = self.fails(fx, "decrypt", *args)
+                self.assertIn(b"reserved", result.stderr)
+                self.assertNotIn(b"looks-encrypted", result.stderr)
+        self.assertEqual(fx.on("get", "AAA").stdout, b"envdirx:v1:\nlooks-encrypted")
+        self.ok(fx, "decrypt", "TOKEN")
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET)
+
+    def test_late_write_failure_keeps_earlier_and_failed_entries(self):
+        for action in ("encrypt", "decrypt"):
+            with self.subTest(action=action):
+                fx = Fixture(self)
+                self.setup(fx, AAA=b"a-value", BBB=b"b-value")
+                if action == "decrypt":
+                    self.ok(fx, "encrypt", "--all")
+                before = {name: (fx.directory / name).read_bytes() for name in ("AAA", "BBB")}
+                real_replace, calls = os.replace, []
+
+                def replace(src, dst):
+                    calls.append(dst)
+                    if len(calls) == 2:
+                        raise OSError("disk full")
+                    real_replace(src, dst)
+
+                argv = ["envdirx", "-d", str(fx.directory), action, "AAA", "BBB"]
+                stderr = io.StringIO()
+                with mock.patch.object(envdirx.os, "replace", replace), mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        envdirx.main()
+                self.assertEqual(raised.exception.code, 111)
+                self.assertIn("disk full", stderr.getvalue())
+                self.assertEqual([Path(p).name for p in calls], ["AAA", "BBB"])
+                self.assertNotEqual((fx.directory / "AAA").read_bytes(), before["AAA"])
+                self.assertEqual((fx.directory / "BBB").read_bytes(), before["BBB"])
+                self.assertEqual(fx.on("get", "AAA").stdout, b"a-value")
+                self.assertEqual([p.name for p in fx.directory.iterdir() if p.name.startswith(".envdirx-")], [])
 
 
 def _keygen(fx, *args, directory=None):
@@ -428,7 +709,7 @@ class DirectoryWorkflowTest(unittest.TestCase):
     def test_other_commands_require_existing_directory(self):
         fx = Fixture(self)
         missing = fx.root / "missing"
-        for args, stdin in ((["set", "A"], b"v"), (["get", "A"], None), (["encrypt"], None), (["keygen", "-k", fx.root / "k"], None), (["run", "--", "true"], None)):
+        for args, stdin in ((["set", "A"], b"v"), (["get", "A"], None), (["encrypt", "--all"], None), (["decrypt", "--all"], None), (["keygen", "-k", fx.root / "k"], None), (["run", "--", "true"], None)):
             with self.subTest(args=args[0]):
                 result = fx.call("-d", missing, *args, input=stdin)
                 self.assertEqual(result.returncode, 111, result.stderr)
@@ -551,7 +832,7 @@ class DirectoryWorkflowTest(unittest.TestCase):
         cipher = (fx.directory / "TOKEN").read_bytes()
         self.assertNotIn(SECRET, cipher)
         self.assertEqual(fx.on("encrypt", "TOKEN").returncode, 111)  # explicitly named: already encrypted
-        self.assertEqual(fx.on("encrypt").returncode, 0)
+        self.assertEqual(fx.on("encrypt", "--all").returncode, 0)
         self.assertEqual((fx.directory / "TOKEN").read_bytes(), cipher)  # skipped, unchanged
         self.assertNotIn(b"other", (fx.directory / "OTHER").read_bytes())
         self.assertEqual(fx.on("get", "--key", fx.root / "hidden.key", "TOKEN").stdout, SECRET)
