@@ -1,5 +1,5 @@
 ### Requirement: Directory-oriented command grammar
-CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt and run. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Legacy init SHALL retain its explicit positional directory and existing behavior when no explicit global directory flag is supplied; explicit global -d with init SHALL fail exit 2 without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
+CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt and run. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Init SHALL NOT be a recognized subcommand, and SHALL fail parsing without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
 
 #### Scenario: Default and explicit directories
 - **WHEN** mkdir followed by plaintext set AAA, get AAA and run -- sh -c 'test -n "$AAA"' execute with default or explicit -d
@@ -8,6 +8,10 @@ CLI SHALL use global -d/--directory before subcommand with cwd-relative default 
 #### Scenario: Child separator
 - **WHEN** run lacks -- or command
 - **THEN** it fails without starting a child
+
+#### Scenario: Removed init
+- **WHEN** init is requested
+- **THEN** exit is 2 and no files are changed
 
 ### Requirement: Safe external key generation
 Keygen SHALL require exactly one of -k/--key filename or -K/--key-dir existing directory, no force flag, no overwrite. -K SHALL name key SHA256(raw public key) as full lowercase hex plus .key. It SHALL write external private key 0600, regular public key 0644 and absolute-target .envdirx.key symlink, preflight all collisions including dangling links, reject resolved in-envdir key destinations and cleanup only newly created artifacts on failure.
