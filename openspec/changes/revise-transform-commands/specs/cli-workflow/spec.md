@@ -38,7 +38,7 @@ Both transformations SHALL validate/read/prepare the entire selected batch befor
 ## MODIFIED Requirements
 
 ### Requirement: Directory-oriented command grammar
-CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt, decrypt and run. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Legacy init SHALL retain its explicit positional directory and existing behavior when no explicit global directory flag is supplied; explicit global -d with init SHALL fail exit 2 without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
+CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt, decrypt and run. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Init SHALL NOT be a recognized subcommand, and SHALL fail parsing without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
 
 #### Scenario: Default and explicit directories
 - **WHEN** mkdir followed by plaintext set AAA, get AAA and run -- sh -c 'test -n "$AAA"' execute with default or explicit -d
@@ -47,6 +47,10 @@ CLI SHALL use global -d/--directory before subcommand with cwd-relative default 
 #### Scenario: Child separator
 - **WHEN** run lacks -- or command
 - **THEN** it fails without starting a child
+
+#### Scenario: Removed init
+- **WHEN** init is requested
+- **THEN** exit is 2 and no files are changed
 
 #### Scenario: Decrypt directory selection
 - **WHEN** decrypt NAME executes with default or explicit -d
