@@ -185,10 +185,12 @@ class EnvdirxTest(unittest.TestCase):
         fx.link_pointer("../alias.key")
         fx.run_ok()
         # Symlink targets never get ~/ expansion.
-        fx.move_key(fx.home / "svc.key")
-        (fx.directory / "~").mkdir()
+        home_key = fx.move_key(fx.home / "svc.key")
         fx.link_pointer("~/svc.key")
-        fx.run_fails()
+        result = fx.run_fails()
+        self.assertIn(b"cannot resolve private key", result.stderr)
+        self.assertNotIn(b"not a regular file", result.stderr)
+        self.assertTrue(home_key.exists())
 
     def test_relative_pointer_survives_relocation(self):
         fx = Fixture(self)
