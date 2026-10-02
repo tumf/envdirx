@@ -264,6 +264,51 @@ def _set(directory: Path, name: str, data: bytes, encrypt: bool) -> None:
     _atomic(path, data, 0o600)
 
 
+def _transform(directory: Path, names: list[str], decrypt: bool, key: str | None) -> None:
+    """Encrypt or decrypt NAMES (or, when empty, every visible entry) in place.
+
+    The whole batch is read, validated and transformed in memory before the
+    first write, so any validation, key or decryption failure changes nothing.
+    Each entry is then replaced atomically on its own; a late write failure
+    keeps earlier replacements (not a transaction) and the failed target intact.
+    """
+    explicit = bool(names)
+    for name in names:
+        _name(name)  # validate raw names before any path is built
+    paths = [directory / name for name in names] if explicit else list(_files(directory))
+    work = []
+    for path in paths:
+        _regular(path)
+        data = path.read_bytes()
+        if data.startswith(MAGIC):
+            encrypted = True
+        elif data.startswith(RESERVED):
+            raise ValueError(f"unsupported ciphertext format: {path.name}")
+        else:
+            encrypted = False
+        if encrypted != decrypt:
+            if explicit:
+                raise ValueError(f"already {'decrypted' if decrypt else 'encrypted'}: {path.name}")
+            continue
+        work.append((path, data))
+    if not work:
+        return  # nothing to convert: no key is looked up
+    if decrypt:
+        private = _private(directory, key)
+        prepared = []
+        for path, data in work:
+            plain = _decrypt(data, path.name, private)
+            if plain.startswith(RESERVED):
+                # Restored plaintext would be misread as ciphertext; keep it encrypted.
+                raise ValueError(f"decrypted value starts with the reserved {RESERVED.decode()} prefix; kept encrypted: {path.name}")
+            prepared.append((path, plain))
+    else:
+        public = _public(directory)
+        prepared = [(path, _encrypt(data, path.name, public)) for path, data in work]
+    for path, data in prepared:
+        _atomic(path, data, 0o600)
+
+
 def _run(directory: Path, key: str | None, command: list[str]) -> None:
     env = os.environ.copy()
     keys = []
@@ -292,7 +337,8 @@ relative to the current directory; only mkdir creates it.
   envdirx [-d DIR] keygen (-k KEYFILE | -K KEYDIR)
   envdirx [-d DIR] set [-c] NAME          < value
   envdirx [-d DIR] get [--key KEY] NAME
-  envdirx [-d DIR] encrypt [NAME ...]
+  envdirx [-d DIR] encrypt (NAME [NAME ...] | --all)
+  envdirx [-d DIR] decrypt [--key KEY] (NAME [NAME ...] | --all)
   envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]"""
 
 KEY_HELP = """\
@@ -325,6 +371,34 @@ the exact bytes are stored as plaintext and no key is read; values starting
 with the reserved "envdirx:" prefix are refused, store them with -c. With -c
 the value is encrypted using only DIRECTORY/.envdirx.pub."""
 
+SELECT_HELP = """\
+Name one or more entries, or pass --all for every visible entry (dotfiles such
+as .envdirx.pub/.envdirx.key are never touched); one of the two is required.
+A named entry already in the target state is an error; --all skips it. The
+whole batch is validated and prepared before the first write, so a failure
+changes nothing; each entry is then replaced atomically (mode 0600) on its
+own. This is not a transaction: if a write fails part-way, entries replaced
+before it stay converted and the failing entry keeps its old bytes."""
+
+ENCRYPT_HELP = """\
+Encrypts plaintext entries in place using only DIRECTORY/.envdirx.pub; no
+private key is read. The public key is read only when something needs
+encrypting.
+
+""" + SELECT_HELP
+
+DECRYPT_HELP = """\
+Decrypts envdirx ciphertext entries in place back to their exact original
+bytes. This deliberately writes the secret to disk as plaintext. A value
+whose original bytes start with the reserved "envdirx:" prefix cannot be
+stored as plaintext and is refused (the entry stays encrypted); read it with
+get and redirect it to a file outside the envdir instead. The private key is
+read only when something needs decrypting.
+
+""" + SELECT_HELP + """
+
+""" + KEY_HELP
+
 KEYGEN_HELP = """\
 Creates a new X25519 key pair: the private key (0600) outside DIRECTORY at
 -k KEYFILE, or in the existing -K KEYDIR named <sha256 of public key>.key;
@@ -341,7 +415,8 @@ def main() -> None:
     keygen = sub.add_parser("keygen", help="create a key pair and .envdirx.key symlink", description=KEYGEN_HELP, formatter_class=text)
     set_cmd = sub.add_parser("set", help="store stdin as one entry (plaintext by default)", description=SET_HELP, formatter_class=text)
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
-    encrypt = sub.add_parser("encrypt", help="encrypt existing plaintext entries in place (public key only)")
+    encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
+    decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group(required=True)
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
@@ -350,13 +425,22 @@ def main() -> None:
     set_cmd.add_argument("name")
     get.add_argument("--key", help="private key to use instead of .envdirx.key")
     get.add_argument("name")
-    encrypt.add_argument("names", nargs="*", help="entries to encrypt; default: all plaintext entries")
+    for transform, verb in ((encrypt, "encrypt"), (decrypt, "decrypt")):
+        transform.add_argument("--all", action="store_true", help=f"{verb} every visible entry that needs it")
+        transform.add_argument("names", nargs="*", metavar="NAME", help=f"entry to {verb}")
+    decrypt.add_argument("--key", help="private key to use instead of .envdirx.key")
     run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
     args = parser.parse_args()
     directory = args.envdir if args.envdir is not None else Path(DEFAULT_DIRECTORY)
     if args.action == "run" and (args.command[:1] != ["--"] or len(args.command) < 2):
         run.error("expected -- COMMAND [ARGS...]")
+    if args.action in ("encrypt", "decrypt"):
+        transform = encrypt if args.action == "encrypt" else decrypt
+        if args.all == bool(args.names):
+            transform.error("expected NAME [NAME ...] or --all (not both)")
+        if len(set(args.names)) != len(args.names):
+            transform.error("duplicate entry name")
     try:
         if args.action == "mkdir":
             _mkdir(directory)
@@ -365,18 +449,8 @@ def main() -> None:
             raise ValueError(f"not a directory: {directory}")
         if args.action == "keygen":
             _keygen(directory, args.key, args.key_dir)
-        elif args.action == "encrypt":
-            public = _public(directory)
-            paths = [directory / name for name in args.names] if args.names else list(_files(directory))
-            for path in paths:
-                _name(path.name)
-                _regular(path)
-                data = path.read_bytes()
-                if data.startswith(MAGIC):
-                    if args.names:
-                        raise ValueError(f"already encrypted: {path.name}")
-                    continue
-                _atomic(path, _encrypt(data, path.name, public), 0o600)
+        elif args.action in ("encrypt", "decrypt"):
+            _transform(directory, args.names, args.action == "decrypt", getattr(args, "key", None))
         elif args.action == "set":
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
         elif args.action == "get":

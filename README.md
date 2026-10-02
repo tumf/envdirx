@@ -21,7 +21,8 @@ uv run envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 | `envdirx [-d D] keygen (-k KEYFILE \| -K KEYDIR)` | 鍵ペアと `.envdirx.key` シンボリックリンクを作成 |
 | `envdirx [-d D] set [-c] NAME` | 標準入力をそのまま保存（既定は平文、`-c` で暗号化） |
 | `envdirx [-d D] get [--key KEY] NAME` | 値の元のバイト列を標準出力へ |
-| `envdirx [-d D] encrypt [NAME ...]` | 既存の平文エントリをその場で暗号化（公開鍵のみ使用） |
+| `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)` | 既存の平文エントリをその場で暗号化（公開鍵のみ使用） |
+| `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)` | 暗号化エントリをその場で平文に戻す（秘密鍵のみ使用） |
 | `envdirx [-d D] run [--key KEY] -- COMMAND [ARGS...]` | envdir を適用してコマンドを実行 |
 
 明示的なディレクトリと鍵ファイルを使う例:
@@ -39,14 +40,43 @@ uv run envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "
 
 `set NAME` は標準入力のバイト列を一切変換せずアトミックに保存する（0600）。鍵もポインタも読まない。ただし `envdirx:` で始まる値は暗号文フォーマット用に予約されているので平文では保存できず、既存のエントリを変更せずに終了コード 111 で失敗する。そのような値は `set -c` で保存する。
 
-`set -c NAME` は `.envdirx.pub` の公開鍵だけを使って暗号化する（秘密鍵は不要）。`encrypt` も同じく公開鍵のみで、既に暗号化されたエントリは変更しない（名前を明示した場合はエラー）。
+`set -c NAME` は `.envdirx.pub` の公開鍵だけを使って暗号化する（秘密鍵は不要）。
 
-既存の envdir を暗号化へ移行する場合は `uv run envdirx -d service.env encrypt`、指定した名前だけなら `uv run envdirx -d service.env encrypt API_TOKEN`。変換前に機密ファイルをバックアップし、変換後に動作確認する。`encrypt` はファイルをアトミックに置換するが、元の平文がディスクやバックアップから消去されたことは保証しない。
+## `encrypt` / `decrypt`: その場での変換
+
+`encrypt` と `decrypt` は対象を必ず明示する。1つ以上のエントリ名か `--all` のどちらか一方が必須で、どちらもない・両方ある・同じ名前の重複は、ディレクトリや鍵を読む前に終了コード 2 で失敗する（引数なしで全エントリを暗号化する旧動作はない）。名前は `set`/`get` と同じ規則で検証し、`../X`、絶対パス、`.envdirx.pub` のようなドットファイルは何も書かずに 111 で拒否する。
+
+- `encrypt` は平文を暗号化し、公開鍵 `.envdirx.pub` だけを使う。秘密鍵は読まない。
+- `decrypt` は暗号文を認証付きで復号し、元のバイト列をそのまま書き戻す（改行・NUL・空ファイルも保持）。秘密鍵だけを使い、公開鍵は不要。鍵の探し方は `run`/`get` と同じで、`--key` はポインタより優先される。
+
+名前を明示したエントリが既に目的の状態（`encrypt` なら暗号文、`decrypt` なら平文）だとエラー 111。`--all` は見えるエントリをすべて対象にし、既に変換済みのものは飛ばす。ドットファイル（鍵のメタデータを含む）には触れない。変換するものがなければ鍵を読まずに成功する。未対応・不正な `envdirx:` フォーマットはどちらの操作でも 111。
+
+**`decrypt` は意図的に秘密を平文のままディスクへ書く。** 変換前に機密ファイルをバックアップし、変換後に動作確認する。ファイルはアトミックに置換するが、元の暗号文・平文がディスクやバックアップから消去されたことは保証しない。
+
+復号した元の値が予約済みの `envdirx:` で始まる場合（`set -c` では保存できる）、そのまま平文に戻すと `get`/`run` が暗号文と誤認するので、`decrypt` はどのエントリも置換する前に 111 で失敗し暗号文を保持する。フォーマットの変更やエスケープはしない。そのような値が平文で必要なら、`get` の出力を envdir の外の適切な権限のファイルへリダイレクトする。
+
+選択したエントリはすべて、最初の書き込みの前に読み込み・検証・変換をメモリ上で済ませる。エントリの欠落・通常ファイル以外・未対応フォーマット・鍵の不正・復号失敗・予約済みプレフィックスのどれかがあれば、何も変更せずに 111 で失敗する。その後、各エントリを個別にアトミック置換する（0600）。**バッチ全体のトランザクションではない**: 途中の書き込みで失敗した場合、それまでに置換したエントリは変換済みのまま残り、失敗したエントリは元のバイト列のまま 111 で終了する。成功時の標準出力は空で、エラーメッセージには名前とパスだけが含まれる。
 
 ```sh
 printf 'old-plain' | uv run envdirx -d service.env set DB_PASSWORD
-uv run envdirx -d service.env encrypt
+uv run envdirx -d service.env encrypt --all
 uv run envdirx -d service.env run --key "$PWD/service.env.key" -- sh -c 'test "$DB_PASSWORD" = old-plain'
+```
+
+指定した名前だけを変換し、平文へ戻す例:
+
+```sh
+uv run envdirx -d app.env mkdir
+uv run envdirx -d app.env keygen -k "$PWD/app.env.key"
+printf 'db-secret' | uv run envdirx -d app.env set DB_PASSWORD
+printf 'visible' | uv run envdirx -d app.env set LOG_LEVEL
+uv run envdirx -d app.env encrypt DB_PASSWORD
+test "$(head -c 12 app.env/DB_PASSWORD)" = "$(printf 'envdirx:v1:\n')"
+uv run envdirx -d app.env decrypt DB_PASSWORD
+test "$(cat app.env/DB_PASSWORD)" = db-secret
+uv run envdirx -d app.env encrypt --all
+uv run envdirx -d app.env decrypt --key "$PWD/app.env.key" --all
+test "$(cat app.env/LOG_LEVEL)" = visible
 ```
 
 ## `get`: 値をそのまま出力する
@@ -100,14 +130,15 @@ uv run envdirx -d service.env run -- true
 
 旧コマンド `init` は削除した。`init` を指定すると未知のサブコマンドとして終了コード 2 で失敗し、何も書かない。新しい envdir は `mkdir` と `keygen` で作る。
 
-以前の `init` で作った envdir（通常ファイルのテキストポインタ `.envdirx.key` と隣の秘密鍵）は変換不要で、そのまま `run`・`get`・`set -c`・`encrypt` で使える。テキストポインタを自動でシンボリックリンクへ書き換えることはない。
+以前の `init` で作った envdir（通常ファイルのテキストポインタ `.envdirx.key` と隣の秘密鍵）は変換不要で、そのまま `run`・`get`・`set -c`・`encrypt`・`decrypt` で使える。テキストポインタを自動でシンボリックリンクへ書き換えることはない。
 
 0.1.0 の正式リリース前に `set`・`encrypt`・`run` の位置引数ディレクトリは廃止した。旧形式は推測で受け付けないので、次のように書き換える。`set` が既定で暗号化しなくなった点に注意し、暗号化したい値には必ず `-c` を付ける。
 
 | 旧 | 新 |
 | --- | --- |
 | `envdirx set DIR NAME` | `envdirx -d DIR set -c NAME` |
-| `envdirx encrypt DIR [NAME ...]` | `envdirx -d DIR encrypt [NAME ...]` |
+| `envdirx encrypt DIR [NAME ...]` | `envdirx -d DIR encrypt (NAME [NAME ...] \| --all)` |
+| `envdirx encrypt`（引数なしで全平文を暗号化） | `envdirx encrypt --all` |
 | `envdirx run [--key K] DIR -- CMD` | `envdirx -d DIR run [--key K] -- CMD` |
 | `envdirx set --key K DIR NAME` / `encrypt --key K ...` | `--key` を外す（公開鍵しか使わない） |
 
