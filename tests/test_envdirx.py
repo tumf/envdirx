@@ -48,14 +48,19 @@ class Fixture:
         """Every path under the fixture root with its bytes or link target."""
         return {p: (os.readlink(p) if p.is_symlink() else None if p.is_dir() else p.read_bytes()) for p in self.root.rglob("*")}
 
-    def init_encrypted(self, *extra):
-        result = self.call("init", *extra, self.directory)
+    def keygen_encrypted(self):
+        """keygen ROOT/service.key (symlink pointer) and store an encrypted TOKEN."""
+        result = self.on("keygen", "-k", self.root / "service.key")
         self.test.assertEqual(result.returncode, 0, result.stderr)
         self.test.assertEqual(self.on("set", "-c", "TOKEN", input=SECRET + b"\n").returncode, 0)
         return result
 
+    def text_pointer(self) -> None:
+        """Replace the pointer with a regular file holding the key path, as old envdirs have."""
+        self.write_pointer(str(self.root / "service.key").encode() + b"\n")
+
     def move_key(self, destination: Path) -> Path:
-        """Move the current key (init default: ROOT/service.key) and drop the pointer."""
+        """Move the current key (default: ROOT/service.key) and drop the pointer."""
         key = getattr(self, "key", self.root / "service.key")
         destination.parent.mkdir(parents=True, exist_ok=True)
         key.rename(destination)
@@ -107,11 +112,13 @@ class EnvdirxTest(unittest.TestCase):
         (directory / "EMPTY").write_bytes(b"\n")
         (directory / "UNSET").write_bytes(b"")
         (directory / "MULTI").write_bytes(b"one\x00two\n")
-        self.assertEqual(fx.call("init", directory).returncode, 0)
         key = fx.root / "service.key"
+        _keygen(fx, "-k", key)
         self.assertEqual(key.stat().st_mode & 0o777, 0o600)
         self.assertEqual((directory / ".envdirx.pub").stat().st_mode & 0o777, 0o644)
-        self.assertEqual((directory / ".envdirx.key").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(os.readlink(directory / ".envdirx.key"), str(key))
+        # Regular-file text pointers keep working alongside keygen's symlinks.
+        fx.text_pointer()
         self.assertEqual((directory / ".envdirx.key").read_bytes(), str(key).encode() + b"\n")
         self.assertEqual(fx.on("encrypt").returncode, 0)
         self.assertNotIn(b"top-secret", (directory / "TOKEN").read_bytes())
@@ -141,34 +148,18 @@ class EnvdirxTest(unittest.TestCase):
         self.assertIn('"PLAIN": "visible"', result.stdout.decode())
         self.assertIn('"UNSET": null', result.stdout.decode())
 
-    def test_init_pointer_roundtrip_and_exit_code(self):
+    def test_keygen_pointer_roundtrip_and_exit_code(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         (fx.directory / "PLAIN").write_bytes(b"mixed\n")
         result = fx.run_ok()
         self.assertIn('"PLAIN": "mixed"', result.stdout.decode())
         result = fx.on("run", "--", sys.executable, "-c", "import sys;sys.exit(7)")
         self.assertEqual(result.returncode, 7)
 
-    def test_init_explicit_destination_relative_to_cwd(self):
-        fx = Fixture(self)
-        (fx.root / "keys").mkdir()
-        result = fx.call("init", "--key", "keys/svc.key", "service", cwd=fx.root)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((fx.directory / ".envdirx.key").read_text(), f"{fx.root / 'keys' / 'svc.key'}\n")
-        self.assertFalse((fx.root / "service.key").exists())
-        self.assertEqual(fx.on("set", "-c", "TOKEN", input=SECRET).returncode, 0)
-        fx.run_ok()
-
-    def test_init_tilde_destination(self):
-        fx = Fixture(self)
-        result = fx.call("init", "--key", "~/svc.key", fx.directory)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((fx.directory / ".envdirx.key").read_text(), f"{fx.home / 'svc.key'}\n")
-
     def test_text_pointer_forms(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.move_key(fx.root / "keys dir" / "svc key ")
         for content in (
             str(key).encode() + b"\n",
@@ -186,7 +177,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_symlink_pointer_forms(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.move_key(fx.root / "keys" / "svc.key")
         for target in (str(key), "../keys/svc.key"):
             with self.subTest(target=target):
@@ -206,7 +197,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_relative_pointer_survives_relocation(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         fx.move_key(fx.root / "service.key")
         fx.write_pointer(b"../service.key\n")
         moved = fx.root / "elsewhere"
@@ -218,7 +209,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_explicit_key_overrides_missing_or_invalid_pointer(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.move_key(fx.root / "keys" / "svc.key")
         fx.run_ok("--key", key)
         result = fx.call("-d", "service", "run", "--key", "keys/svc.key", "--", *SHOW, cwd=fx.root)
@@ -237,7 +228,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_no_adjacent_fallback_without_pointer(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         (fx.directory / ".envdirx.key").unlink()
         self.assertTrue((fx.root / "service.key").exists())
         result = fx.run_fails()
@@ -245,7 +236,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_invalid_text_pointers_fail_closed(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = str(fx.root / "service.key").encode()
         for content in (b"", b"\n", b"\r\n", key + b"\n" + key + b"\n", key + b"\n\n", key + b"\r", b"\xff" + key, key + b"\x00", b"rel\nmore"):
             with self.subTest(content=content):
@@ -254,7 +245,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_invalid_symlink_pointers_fail_closed(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         fx.link_pointer("../does-not-exist.key")
         fx.run_fails()
         (fx.root / "loop-a").symlink_to(fx.root / "loop-b")
@@ -266,7 +257,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_nonregular_pointer_fails_closed(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         pointer = fx.directory / ".envdirx.key"
         pointer.unlink()
         os.mkfifo(pointer)
@@ -278,7 +269,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_invalid_key_targets_fail_closed(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.root / "service.key"
         (fx.root / "keydir").mkdir()
         fx.write_pointer(b"../keydir\n")
@@ -301,7 +292,7 @@ class EnvdirxTest(unittest.TestCase):
 
     def test_key_inside_envdir_rejected_through_aliases(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         inner = fx.directory / ".private"
         inner.write_bytes((fx.root / "service.key").read_bytes())
         inner.chmod(0o600)
@@ -321,66 +312,9 @@ class EnvdirxTest(unittest.TestCase):
         fx.write_pointer(b".\n")
         fx.run_fails()
 
-    def test_init_refuses_existing_entries_and_preserves_them(self):
-        cases = {
-            "dangling pointer": lambda fx: (fx.directory / ".envdirx.key").symlink_to("nowhere"),
-            "pointer file": lambda fx: (fx.directory / ".envdirx.key").write_text("/x\n"),
-            "public key": lambda fx: (fx.directory / ".envdirx.pub").write_bytes(b"p"),
-            "private key": lambda fx: (fx.root / "service.key").write_bytes(b"k"),
-            "dangling private key": lambda fx: (fx.root / "service.key").symlink_to("nowhere"),
-        }
-        for name, prepare in cases.items():
-            with self.subTest(name):
-                fx = Fixture(self)
-                prepare(fx)
-                before = {p: (os.readlink(p) if p.is_symlink() else p.read_bytes()) for p in (fx.directory / ".envdirx.key", fx.directory / ".envdirx.pub", fx.root / "service.key") if os.path.lexists(p)}
-                result = fx.call("init", fx.directory)
-                self.assertEqual(result.returncode, 111)
-                self.assertIn(b"refusing to overwrite", result.stderr)
-                after = {p: (os.readlink(p) if p.is_symlink() else p.read_bytes()) for p in (fx.directory / ".envdirx.key", fx.directory / ".envdirx.pub", fx.root / "service.key") if os.path.lexists(p)}
-                self.assertEqual(before, after)
-
-    def test_init_rejects_bad_destinations_without_writing(self):
-        fx = Fixture(self)
-        alias = fx.root / "alias"
-        alias.symlink_to(fx.directory)
-        for key in (fx.directory / "k", alias / "sub.key", fx.root / "missing-parent" / "k", fx.root / "file" / "k", fx.directory):
-            with self.subTest(key=key):
-                (fx.root / "file").write_bytes(b"")
-                result = fx.call("init", "--key", key, fx.directory)
-                self.assertEqual(result.returncode, 111, result.stderr)
-                self.assertEqual(sorted(p.name for p in fx.directory.iterdir()), [])
-                self.assertFalse((fx.root / "missing-parent").exists())
-        result = fx.call("init", "--key", fx.directory / ".." / "service" / "k", fx.directory)
-        self.assertEqual(result.returncode, 111)
-        self.assertIn(b"outside the envdir", result.stderr)
-
-    def test_init_failure_removes_only_created_files(self):
-        fx = Fixture(self)
-        (fx.directory / "TOKEN").write_bytes(b"keep")
-        real = envdirx._create
-        calls = []
-
-        def flaky(path, data, mode):
-            calls.append(path)
-            if len(calls) == 3:
-                raise OSError("disk full")
-            real(path, data, mode)
-
-        argv = ["envdirx", "init", str(fx.directory)]
-        with mock.patch.object(envdirx, "_create", flaky), mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as raised:
-                envdirx.main()
-        self.assertEqual(raised.exception.code, 111)
-        self.assertEqual(len(calls), 3)
-        self.assertFalse(os.path.lexists(fx.root / "service.key"))
-        self.assertFalse(os.path.lexists(fx.directory / ".envdirx.key"))
-        self.assertFalse(os.path.lexists(fx.directory / ".envdirx.pub"))
-        self.assertEqual((fx.directory / "TOKEN").read_bytes(), b"keep")
-
     def test_wrong_owner_rejected(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         with mock.patch.object(envdirx.os, "geteuid", return_value=os.geteuid() + 1):
             with self.assertRaisesRegex(ValueError, "owned by the current user"):
                 envdirx._private(fx.directory, None)
@@ -388,10 +322,10 @@ class EnvdirxTest(unittest.TestCase):
     def test_help_describes_grammar(self):
         fx = Fixture(self)
         main_help = fx.call("--help").stdout
-        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen (-k KEYFILE | -K KEYDIR)", b"set [-c] NAME", b"run [--key KEY] -- COMMAND", b"legacy; rejects -d"):
+        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen (-k KEYFILE | -K KEYDIR)", b"set [-c] NAME", b"run [--key KEY] -- COMMAND"):
             self.assertIn(text, main_help)
-        self.assertIn(b"destination", fx.call("init", "--help").stdout)
-        self.assertIn(b"Legacy", fx.call("init", "--help").stdout)
+        self.assertNotIn(b"init", main_help)
+        self.assertNotIn(b"legacy", main_help.lower())
         run_help = fx.call("run", "--help").stdout
         self.assertIn(b"must precede it", run_help)
         self.assertIn(b".envdirx.key", run_help)
@@ -410,8 +344,9 @@ class EnvdirxTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         blocks = [b for b in re.findall(r"```sh\n(.*?)```", readme, re.S) if "envdirx" in b and "unittest" not in b]
         self.assertGreaterEqual(len(blocks), 5)
-        for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`init [--key KEY] DIRECTORY`", "`set -c`"):
+        for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`set -c`", "`init` は削除した"):
             self.assertIn(text, readme)
+        self.assertNotIn("envdirx init", readme)
         skill = (ROOT / ".agents" / "skills" / "envdirx-operations" / "SKILL.md").read_text()
         self.assertIn("stores **plaintext** by default", skill)
         for block in blocks:
@@ -425,8 +360,8 @@ class EnvdirxTest(unittest.TestCase):
                 shim.chmod(0o755)
                 # Blocks that do not create their own envdir start from a legacy one:
                 # adjacent key, encrypted entry, no pointer.
-                legacy = "mkdir -p service.env\nuv run envdirx init service.env\nprintf s | uv run envdirx -d service.env set -c API_TOKEN\nrm service.env/.envdirx.key\n"
-                creates = any(word in block for word in ("envdirx init", "keygen", "mkdir"))
+                legacy = "uv run envdirx -d service.env mkdir\nuv run envdirx -d service.env keygen -k service.env.key\nprintf s | uv run envdirx -d service.env set -c API_TOKEN\nrm service.env/.envdirx.key\n"
+                creates = any(word in block for word in ("keygen", "mkdir"))
                 prelude = "set -eu\n" + ("" if creates else legacy)
                 env = {**fx.env, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
                 result = subprocess.run(["sh", "-c", prelude + block], cwd=fx.root, env=env, capture_output=True, timeout=60)
@@ -654,20 +589,24 @@ class DirectoryWorkflowTest(unittest.TestCase):
         self.assertEqual(fx.call("set", "-d", fx.directory, "AAA", input=b"new").returncode, 2)
         self.assertEqual((fx.directory / "AAA").read_bytes(), b"value")
 
-    def test_init_rejects_explicit_global_directory(self):
+    def test_init_is_rejected_without_writes(self):
         fx = Fixture(self)
-        other = fx.root / "other"
-        other.mkdir()
+        (fx.directory / "AAA").write_bytes(b"value")
         before = fx.snapshot()
-        for flag in ("-d", "--directory"):
-            for target in (other, fx.directory, Path(".envs")):
-                with self.subTest(flag=flag, target=target):
-                    result = fx.call(flag, target, "init", fx.directory)
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertEqual(fx.snapshot(), before)
-        # Without -d the legacy positional init works and the new grammar uses it.
-        fx.init_encrypted()
-        self.assertEqual((fx.directory / ".envdirx.key").read_bytes(), str(fx.root / "service.key").encode() + b"\n")
+        for args in (
+            ("init", fx.directory),
+            ("init", "--key", fx.root / "svc.key", fx.directory),
+            ("-d", fx.directory, "init"),
+            ("--directory", fx.root / "other", "init", fx.directory),
+        ):
+            with self.subTest(args=args):
+                result = fx.call(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"invalid choice: 'init'", result.stderr)
+                self.assertEqual(fx.snapshot(), before)
+        # Envdirs with a regular text pointer (as init used to write) still work.
+        fx.keygen_encrypted()
+        fx.text_pointer()
         self.assertFalse((fx.directory / ".envdirx.key").is_symlink())
         self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
         fx.run_ok()
@@ -686,7 +625,7 @@ class GetFailureTest(unittest.TestCase):
 
     def test_missing_and_invalid_entries(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         self.get_fails(fx, name="MISSING")
         (fx.directory / "BAD").write_bytes(b"envdirx:v2:\nunsupported")
         self.get_fails(fx, name="BAD")
@@ -703,7 +642,7 @@ class GetFailureTest(unittest.TestCase):
 
     def test_invalid_key_references(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.root / "service.key"
         (fx.directory / ".envdirx.key").unlink()
         self.assertIn(b"missing key pointer", self.get_fails(fx).stderr)
@@ -731,7 +670,7 @@ class GetFailureTest(unittest.TestCase):
 
     def test_key_override_agrees_with_run(self):
         fx = Fixture(self)
-        fx.init_encrypted()
+        fx.keygen_encrypted()
         key = fx.move_key(fx.root / "keys" / "svc.key")
         fx.link_pointer("missing.key")
         self.get_fails(fx)

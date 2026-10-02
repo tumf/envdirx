@@ -5,7 +5,7 @@ description: Use when changing or operating envdirx plaintext or encrypted DJB e
 
 # envdirx operations
 
-- Grammar: `envdirx [-d DIR] mkdir | keygen (-k FILE | -K DIR) | set [-c] NAME | get [--key K] NAME | encrypt [NAME ...] | run [--key K] -- CMD`. `-d` goes before the subcommand and defaults to `./.envs` (cwd-relative); only `mkdir` creates directories. Positional directories for set/encrypt/run are gone; `init [--key K] DIRECTORY` is the only legacy exception and rejects `-d`.
+- Grammar: `envdirx [-d DIR] mkdir | keygen (-k FILE | -K DIR) | set [-c] NAME | get [--key K] NAME | encrypt [NAME ...] | run [--key K] -- CMD`. `-d` goes before the subcommand and defaults to `./.envs` (cwd-relative); only `mkdir` creates directories. Positional directories for set/encrypt/run are gone, and `init` was removed (it now fails with exit 2); create envdirs with `mkdir` + `keygen`. Existing regular-file text pointers written by the old init stay valid; never convert or delete them.
 - `set NAME` stores **plaintext** by default and reads no key. Never assume `set` encrypts: pass `-c` for anything secret, and verify the stored file starts with `envdirx:v1:` when it must be encrypted. Plaintext values starting with `envdirx:` are refused; use `-c` for those.
 - `get` prints the raw stored/decrypted bytes (no newline, no DJB trimming). It discloses secrets: only run it when the user explicitly asks, and never into logs or transcripts.
 - Preserve DJB envdir first-line, trim, NUL-to-newline and empty-file-unset behavior in `run`; `run` requires the literal `--` and `--key` must precede it.
