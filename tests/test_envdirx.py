@@ -351,11 +351,14 @@ class EnvdirxTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         blocks = [b for b in re.findall(r"```sh\n(.*?)```", readme, re.S) if "envdirx" in b and "unittest" not in b]
         self.assertGreaterEqual(len(blocks), 5)
-        for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`set -c`", "`init` は削除した"):
+        for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`set -c`", "`init` has been removed"):
             self.assertIn(text, readme)
         self.assertNotIn("envdirx init", readme)
-        for text in ("encrypt (NAME [NAME ...] \\| --all)", "decrypt [--key KEY] (NAME [NAME ...] \\| --all)", "encrypt --all", 'decrypt --key "$PWD/app.env.key" --all', "意図的に秘密を平文のままディスクへ書く"):
+        for text in ("encrypt (NAME [NAME ...] \\| --all)", "decrypt [--key KEY] (NAME [NAME ...] \\| --all)", "encrypt --all", 'decrypt --key "$PWD/app.env.key" --all', "intentionally leaves secrets as plaintext on disk"):
             self.assertIn(text, readme)
+        readme_ja = (ROOT / "README.ja.md").read_text()
+        for text in ("`init` は削除した", "意図的に秘密を平文のままディスクへ書く"):
+            self.assertIn(text, readme_ja)
         self.assertNotIn("encrypt [NAME ...]`", readme)
         self.assertIsNone(re.search(r"envdirx(?: -d \S+)? encrypt\s*$", readme, re.M), "no implicit-all encrypt")
         skill = (ROOT / ".agents" / "skills" / "envdirx-operations" / "SKILL.md").read_text()
