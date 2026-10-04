@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import os
 import stat
 import sys
@@ -331,8 +332,10 @@ def _run(directory: Path, key: str | None, command: list[str]) -> None:
 DESCRIPTION = """\
 Store DJB envdir entries as plaintext or encrypted files and run commands with
 them. -d/--directory goes BEFORE the subcommand and defaults to ./.envs
-relative to the current directory; only mkdir creates it.
+relative to the current directory; only mkdir creates it. -V/--version is
+global too: it prints the installed version and reads no envdir.
 
+  envdirx (-V | --version)
   envdirx [-d DIR] mkdir
   envdirx [-d DIR] keygen (-k KEYFILE | -K KEYDIR)
   envdirx [-d DIR] set [-c] NAME          < value
@@ -410,6 +413,7 @@ def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(prog="envdirx", description=DESCRIPTION, formatter_class=text)
     parser.add_argument("-d", "--directory", dest="envdir", type=Path, metavar="DIRECTORY", help="envdir (default: ./.envs); must precede the subcommand")
+    parser.add_argument("-V", "--version", action="version", version=importlib.metadata.version("envdirx"), help="print the installed version and exit; global like -d")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("mkdir", help="create the envdir (mode 0700) and missing parents")
     keygen = sub.add_parser("keygen", help="create a key pair and .envdirx.key symlink", description=KEYGEN_HELP, formatter_class=text)

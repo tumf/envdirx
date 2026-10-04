@@ -25,6 +25,7 @@ After publication, install with `uv tool install envdirx` and replace `uv run en
 
 | Command | Action |
 | --- | --- |
+| `envdirx --version` / `envdirx -V` | Print the installed envdirx version and one newline, then exit 0. Like `-d`, it goes before any subcommand and needs no envdir or key. |
 | `envdirx [-d D] mkdir` | Create the envdir and missing parents; a new envdir has mode 0700. An existing directory is left unchanged; a non-directory fails with status 111. |
 | `envdirx [-d D] keygen (-k KEYFILE \| -K KEYDIR)` | Create a key pair and the `.envdirx.key` symlink. |
 | `envdirx [-d D] set [-c] NAME` | Store stdin unchanged as plaintext, or encrypt with `-c`. |
@@ -114,6 +115,12 @@ Alternatively, if the pointer does not already exist, use `ln -s ../service.env.
 | `envdirx encrypt` (implicitly all) | `envdirx encrypt --all` |
 | `envdirx run [--key K] DIR -- CMD` | `envdirx -d DIR run [--key K] -- CMD` |
 | `envdirx set --key K DIR NAME` / `encrypt --key K ...` | Omit `--key`; these operations only use the public key. |
+
+## Versioning and releases
+
+`envdirx --version` reports the installed distribution's version; `project.version` in `pyproject.toml` is the only place the version is defined. `run -- COMMAND --version` passes `--version` to the child unchanged.
+
+Releases are manual and use semantic `MAJOR.MINOR.PATCH` versions. Before 1.0, incompatible CLI changes increment MINOR, and compatible additions and fixes increment PATCH. To release, run `uv version <version>` (which updates both `pyproject.toml` and `uv.lock`), run the tests, commit, and tag the commit as `v<version>`. Pushing the tag and publishing the package are separate operator actions.
 
 ## Runtime behavior
 
