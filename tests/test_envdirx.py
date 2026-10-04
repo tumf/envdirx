@@ -1,4 +1,5 @@
 import contextlib
+import importlib.metadata
 import hashlib
 import io
 import os
@@ -7,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -366,6 +368,10 @@ class EnvdirxTest(unittest.TestCase):
         for text in ("encrypt (NAME ... | --all)", "decrypt [--key K] (NAME ... | --all)", "plaintext on disk"):
             self.assertIn(text, skill)
         self.assertNotIn("encrypt [NAME ...]", skill)
+        for text in ("`envdirx --version` / `envdirx -V`", "`uv version <version>`", "`v<version>`", "MAJOR.MINOR.PATCH"):
+            self.assertIn(text, readme)
+            self.assertIn(text, readme_ja)
+        self.assertIn("envdirx (-V | --version)", skill)
         for block in blocks:
             with self.subTest(block=block.splitlines()[0]):
                 fx = Fixture(self)
@@ -383,6 +389,48 @@ class EnvdirxTest(unittest.TestCase):
                 env = {**fx.env, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
                 result = subprocess.run(["sh", "-c", prelude + block], cwd=fx.root, env=env, capture_output=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr.decode() + block)
+
+
+class VersionTest(unittest.TestCase):
+    """Global -V/--version reports the installed distribution version and touches nothing."""
+
+    def version(self):
+        declared = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+        installed = importlib.metadata.version("envdirx")
+        self.assertEqual(installed, declared, "reinstall the project: metadata and pyproject.toml disagree")
+        return installed
+
+    def test_version_flags_from_unrelated_directory(self):
+        version = self.version()
+        fx = Fixture(self)
+        empty = fx.root / "elsewhere"
+        empty.mkdir()
+        before = fx.snapshot()
+        for args in (["--version"], ["-V"], ["-d", fx.root / "missing", "--version"], ["-d", fx.root / "missing", "-V"]):
+            with self.subTest(args=args):
+                result = fx.call(*args, cwd=empty)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, version.encode() + b"\n", b""))
+                self.assertEqual(fx.snapshot(), before)
+                self.assertFalse((empty / ".envs").exists())
+
+    def test_version_has_no_duplicate_source(self):
+        source = (ROOT / "src" / "envdirx" / "__init__.py").read_text()
+        self.assertNotIn(self.version(), source)
+        self.assertNotIn("pyproject", source)
+        self.assertIn('importlib.metadata.version("envdirx")', source)
+
+    def test_help_and_child_version_flags(self):
+        fx = Fixture(self)
+        main_help = fx.call("--help").stdout
+        for text in (b"-V, --version", b"envdirx (-V | --version)", b"global like -d", b"-V/--version is\nglobal too"):
+            self.assertIn(text, main_help)
+        result = fx.on("run", "--version")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        argv = [sys.executable, "-c", "import sys;print(sys.argv[1:])", "--version", "-V"]
+        result = fx.on("run", "--", *argv)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b"['--version', '-V']")
 
 
 class TransformTest(unittest.TestCase):

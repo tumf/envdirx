@@ -17,6 +17,7 @@ uv run envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 
 | コマンド | 動作 |
 | --- | --- |
+| `envdirx --version` / `envdirx -V` | インストール済み envdirx のバージョンと改行1つを出力して終了コード 0。`-d` と同じくサブコマンドより前に置き、envdir も鍵も不要 |
 | `envdirx [-d D] mkdir` | 親を含めて作成。新規 envdir は 0700。既存ディレクトリは何も変えず成功、ディレクトリ以外があれば 111 |
 | `envdirx [-d D] keygen (-k KEYFILE \| -K KEYDIR)` | 鍵ペアと `.envdirx.key` シンボリックリンクを作成 |
 | `envdirx [-d D] set [-c] NAME` | 標準入力をそのまま保存（既定は平文、`-c` で暗号化） |
@@ -141,6 +142,12 @@ uv run envdirx -d service.env run -- true
 | `envdirx encrypt`（引数なしで全平文を暗号化） | `envdirx encrypt --all` |
 | `envdirx run [--key K] DIR -- CMD` | `envdirx -d DIR run [--key K] -- CMD` |
 | `envdirx set --key K DIR NAME` / `encrypt --key K ...` | `--key` を外す（公開鍵しか使わない） |
+
+## バージョンとリリース
+
+`envdirx --version` はインストール済みディストリビューションのバージョンを表示する。バージョンを定義するのは `pyproject.toml` の `project.version` だけ（現在は 0.1.0）。`run -- COMMAND --version` の `--version` はそのまま子コマンドへ渡る。
+
+リリースは手動で、セマンティックバージョン `MAJOR.MINOR.PATCH` を使う。1.0 より前は、互換性のない CLI 変更で MINOR を、互換性のある追加・修正で PATCH を上げる。リリース手順は `uv version <version>`（`pyproject.toml` と `uv.lock` を同時に更新）、テスト実行、コミット、そのコミットへの `v<version>` タグ付け。タグの push とパッケージ公開は別途オペレーターが行う。
 
 ## 実行時の意味
 
