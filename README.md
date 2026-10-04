@@ -118,7 +118,7 @@ Alternatively, if the pointer does not already exist, use `ln -s ../service.env.
 
 ## Versioning and releases
 
-`envdirx --version` reports the installed distribution's version; `project.version` in `pyproject.toml` is the only place the version is defined (currently 0.1.0). `run -- COMMAND --version` passes `--version` to the child unchanged.
+`envdirx --version` reports the installed distribution's version; `project.version` in `pyproject.toml` is the only place the version is defined. `run -- COMMAND --version` passes `--version` to the child unchanged.
 
 Releases are manual and use semantic `MAJOR.MINOR.PATCH` versions. Before 1.0, incompatible CLI changes increment MINOR, and compatible additions and fixes increment PATCH. To release, run `uv version <version>` (which updates both `pyproject.toml` and `uv.lock`), run the tests, commit, and tag the commit as `v<version>`. Pushing the tag and publishing the package are separate operator actions.
 

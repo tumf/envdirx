@@ -145,7 +145,7 @@ uv run envdirx -d service.env run -- true
 
 ## バージョンとリリース
 
-`envdirx --version` はインストール済みディストリビューションのバージョンを表示する。バージョンを定義するのは `pyproject.toml` の `project.version` だけ（現在は 0.1.0）。`run -- COMMAND --version` の `--version` はそのまま子コマンドへ渡る。
+`envdirx --version` はインストール済みディストリビューションのバージョンを表示する。バージョンを定義するのは `pyproject.toml` の `project.version` だけ。`run -- COMMAND --version` の `--version` はそのまま子コマンドへ渡る。
 
 リリースは手動で、セマンティックバージョン `MAJOR.MINOR.PATCH` を使う。1.0 より前は、互換性のない CLI 変更で MINOR を、互換性のある追加・修正で PATCH を上げる。リリース手順は `uv version <version>`（`pyproject.toml` と `uv.lock` を同時に更新）、テスト実行、コミット、そのコミットへの `v<version>` タグ付け。タグの push とパッケージ公開は別途オペレーターが行う。
 

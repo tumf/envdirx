@@ -372,6 +372,10 @@ class EnvdirxTest(unittest.TestCase):
             self.assertIn(text, readme)
             self.assertIn(text, readme_ja)
         self.assertIn("envdirx (-V | --version)", skill)
+        version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+        for text, heading in ((readme, "## Versioning and releases"), (readme_ja, "## バージョンとリリース")):
+            section = text.split(heading, 1)[1].split("\n## ", 1)[0]
+            self.assertNotIn(version, section, f"{heading} must not hard-code the current version")
         for block in blocks:
             with self.subTest(block=block.splitlines()[0]):
                 fx = Fixture(self)
