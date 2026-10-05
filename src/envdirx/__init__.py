@@ -132,13 +132,13 @@ def _encrypt(data: bytes, name: str, public: X25519PublicKey) -> bytes:
     nonce = os.urandom(12)
     raw_pub = ephemeral.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     payload = raw_pub + nonce + _cipher(ephemeral.exchange(public)).encrypt(nonce, data, name.encode())
-    return MAGIC + base64.b64encode(payload)
+    return MAGIC + base64.b64encode(payload) + b"\n"
 
 
 def _decrypt(data: bytes, name: str, private: X25519PrivateKey) -> bytes:
     if data.startswith(MAGIC):
         try:
-            payload = base64.b64decode(data[len(MAGIC):], validate=True)
+            payload = base64.b64decode(data[len(MAGIC):].removesuffix(b"\n"), validate=True)
         except binascii.Error:
             raise ValueError(f"invalid ciphertext: {name}") from None
     else:

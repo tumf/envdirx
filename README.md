@@ -2,7 +2,7 @@
 
 [日本語版 README](README.ja.md)
 
-`envdirx` is a CLI that keeps the DJB `envdir` convention: one file per environment variable. `set` stores plaintext by default; `set -c` encrypts. Plaintext and encrypted entries can coexist, and `run` reads both. An encrypted entry named `GOG_KEYRING_PASSWORD` has printable `encrypted:B...` Base64 text inside its file, **not** a `GOG_KEYRING_PASSWORD=` line. Existing binary `envdirx:v1:` entries remain readable; new writes use the printable format. It serves a similar purpose to dotenvx, but its ciphertext and keys are **not compatible**.
+`envdirx` is a CLI that keeps the DJB `envdir` convention: one file per environment variable. `set` stores plaintext by default; `set -c` encrypts. Plaintext and encrypted entries can coexist, and `run` reads both. An encrypted entry named `GOG_KEYRING_PASSWORD` has printable `encrypted:B...` Base64 text inside its file, **not** a `GOG_KEYRING_PASSWORD=` line. Existing binary `envdirx:v1:` entries remain readable; new writes use the printable format with one trailing LF. Readers also accept no trailing LF; embedded or repeated newlines and CRLF are rejected. It serves a similar purpose to dotenvx, but its ciphertext and keys are **not compatible**.
 
 Requires Python 3.13 or newer on POSIX. The default envdir is `./.envs` relative to the current working directory. Put `-d/--directory DIRECTORY` **before** the subcommand. Only `mkdir` creates the envdir; other commands require it to exist.
 

@@ -147,10 +147,12 @@ class EnvdirxTest(unittest.TestCase):
         fx = Fixture(self)
         fx.keygen_encrypted()
         stored = (fx.directory / "TOKEN").read_bytes()
-        self.assertRegex(stored, rb"\Aencrypted:B[A-Za-z0-9+/]+={0,2}\Z")
+        self.assertRegex(stored, rb"\Aencrypted:B[A-Za-z0-9+/]+={0,2}\n\Z")
         self.assertNotIn(SECRET, stored)
         self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
-        legacy = b"envdirx:v1:\n" + base64.b64decode(stored[len(b"encrypted:B"):], validate=True)
+        (fx.directory / "TOKEN").write_bytes(stored.removesuffix(b"\n"))
+        self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
+        legacy = b"envdirx:v1:\n" + base64.b64decode(stored[len(b"encrypted:B"):].removesuffix(b"\n"), validate=True)
         (fx.directory / "TOKEN").write_bytes(legacy)
         self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
         self.assertEqual(fx.on("encrypt", "--all").returncode, 0)
@@ -162,7 +164,7 @@ class EnvdirxTest(unittest.TestCase):
         fx = Fixture(self)
         fx.keygen_encrypted()
         original = (fx.directory / "TOKEN").read_bytes()
-        for bad in (b"encrypted:B!", b"encrypted:B", b"encrypted:future", original[:-2] + b"!!"):
+        for bad in (b"encrypted:B!", b"encrypted:B", b"encrypted:future", original[:-2] + b"!!", original + b"\n", original.replace(b"encrypted:B", b"encrypted:B\n"), original.removesuffix(b"\n") + b"\r\n"):
             with self.subTest(bad=bad):
                 (fx.directory / "TOKEN").write_bytes(bad)
                 result = fx.on("get", "TOKEN")
