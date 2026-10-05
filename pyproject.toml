@@ -3,6 +3,8 @@ name = "envdirx"
 version = "0.1.0"
 description = "Store DJB envdir entries as plaintext or encrypted files with an external private key"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["envdir", "environment-variables", "encryption", "cli"]
 classifiers = [
     "Environment :: Console",

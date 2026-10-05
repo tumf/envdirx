@@ -6,6 +6,8 @@
 
 Requires Python 3.13 or newer on POSIX. The default envdir is `./.envs` relative to the current working directory. Put `-d/--directory DIRECTORY` **before** the subcommand. Only `mkdir` creates the envdir; other commands require it to exist.
 
+Licensed under the [MIT License](LICENSE).
+
 ## Install and quick start
 
 From this repository, while preparing the first PyPI release:

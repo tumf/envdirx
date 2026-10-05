@@ -4,6 +4,8 @@ DJB `envdir` の1ファイル1変数を保つ CLI。値は既定で平文のま�
 
 envdir は `-d/--directory DIRECTORY` で指定し、**サブコマンドより前**に置く。省略時はカレントディレクトリ基準の `./.envs`。ディレクトリを作るのは `mkdir` だけで、他のコマンドは既存のディレクトリを要求する。
 
+[MIT License](LICENSE)で配布します。
+
 ```sh
 uv sync
 mkdir -p ~/.envdirx-keys
