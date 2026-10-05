@@ -1,6 +1,6 @@
 # envdirx
 
-DJB `envdir` の1ファイル1変数を保つ CLI。値は既定で平文のまま保存し、`set -c` を付けたものだけを暗号化する。平文と暗号文のエントリは同じディレクトリに混在でき、`run` はどちらも読む。
+DJB `envdir` の1ファイル1変数を保つ CLI。値は既定で平文のまま保存し、`set -c` を付けたものだけを暗号化する。平文と暗号文のエントリは同じディレクトリに混在でき、`run` はどちらも読む。暗号文はファイル名を変数名とし、ファイル内容を `encrypted:B...`（Base64テキスト）とする。例えば `GOG_KEYRING_PASSWORD` ファイルの中身が `encrypted:B...` となる。ファイル内に `GOG_KEYRING_PASSWORD=` は書かない。dotenvx と同じ暗号形式・鍵形式ではない。従来の `envdirx:v1:` 暗号文も読み込めるが、新規書き込みは新形式となる。
 
 envdir は `-d/--directory DIRECTORY` で指定し、**サブコマンドより前**に置く。省略時はカレントディレクトリ基準の `./.envs`。ディレクトリを作るのは `mkdir` だけで、他のコマンドは既存のディレクトリを要求する。
 
@@ -39,7 +39,7 @@ uv run envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "
 
 ## `set`: 平文が既定、暗号化は `-c`
 
-`set NAME` は標準入力のバイト列を一切変換せずアトミックに保存する（0600）。鍵もポインタも読まない。ただし `envdirx:` で始まる値は暗号文フォーマット用に予約されているので平文では保存できず、既存のエントリを変更せずに終了コード 111 で失敗する。そのような値は `set -c` で保存する。
+`set NAME` は標準入力のバイト列を一切変換せずアトミックに保存する（0600）。鍵もポインタも読まない。ただし `envdirx:` または `encrypted:` で始まる値は暗号文フォーマット用に予約されているので平文では保存できず、既存のエントリを変更せずに終了コード 111 で失敗する。そのような値は `set -c` で保存する。
 
 `set -c NAME` は `.envdirx.pub` の公開鍵だけを使って暗号化する（秘密鍵は不要）。
 
@@ -72,7 +72,7 @@ uv run envdirx -d app.env keygen -k "$PWD/app.env.key"
 printf 'db-secret' | uv run envdirx -d app.env set DB_PASSWORD
 printf 'visible' | uv run envdirx -d app.env set LOG_LEVEL
 uv run envdirx -d app.env encrypt DB_PASSWORD
-test "$(head -c 12 app.env/DB_PASSWORD)" = "$(printf 'envdirx:v1:\n')"
+test "$(cut -c 1-11 app.env/DB_PASSWORD)" = 'encrypted:B'
 uv run envdirx -d app.env decrypt DB_PASSWORD
 test "$(cat app.env/DB_PASSWORD)" = db-secret
 uv run envdirx -d app.env encrypt --all

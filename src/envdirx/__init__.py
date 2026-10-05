@@ -1,6 +1,8 @@
 """DJB envdir files, plaintext or encrypted. Ciphertext remains in the envdir; keys do not."""
 
 import argparse
+import base64
+import binascii
 import hashlib
 import importlib.metadata
 import os
@@ -16,11 +18,16 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import serialization
 
-MAGIC = b"envdirx:v1:\n"
+MAGIC = b"encrypted:B"
+LEGACY_MAGIC = b"envdirx:v1:\n"
 PUB = ".envdirx.pub"
 POINTER = ".envdirx.key"
-RESERVED = b"envdirx:"  # every envdirx format starts with this; plaintext may not
+RESERVED = (b"envdirx:", b"encrypted:")
 DEFAULT_DIRECTORY = ".envs"
+
+
+def _reserved(data: bytes) -> bool:
+    return data.startswith(RESERVED)
 
 
 def _home(text: str) -> Path:
@@ -124,17 +131,24 @@ def _encrypt(data: bytes, name: str, public: X25519PublicKey) -> bytes:
     ephemeral = X25519PrivateKey.generate()
     nonce = os.urandom(12)
     raw_pub = ephemeral.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return MAGIC + raw_pub + nonce + _cipher(ephemeral.exchange(public)).encrypt(nonce, data, name.encode())
+    payload = raw_pub + nonce + _cipher(ephemeral.exchange(public)).encrypt(nonce, data, name.encode())
+    return MAGIC + base64.b64encode(payload)
 
 
 def _decrypt(data: bytes, name: str, private: X25519PrivateKey) -> bytes:
-    if len(data) < len(MAGIC) + 32 + 12 + 16:
+    if data.startswith(MAGIC):
+        try:
+            payload = base64.b64decode(data[len(MAGIC):], validate=True)
+        except binascii.Error:
+            raise ValueError(f"invalid ciphertext: {name}") from None
+    else:
+        payload = data[len(LEGACY_MAGIC):]
+    if len(payload) < 32 + 12 + 16:
         raise ValueError(f"invalid ciphertext: {name}")
-    offset = len(MAGIC)
-    ephemeral = X25519PublicKey.from_public_bytes(data[offset:offset + 32])
-    nonce = data[offset + 32:offset + 44]
+    ephemeral = X25519PublicKey.from_public_bytes(payload[:32])
+    nonce = payload[32:44]
     try:
-        return _cipher(private.exchange(ephemeral)).decrypt(nonce, data[offset + 44:], name.encode())
+        return _cipher(private.exchange(ephemeral)).decrypt(nonce, payload[44:], name.encode())
     except InvalidTag as exc:
         raise ValueError(f"decryption failed: {name}") from exc
 
@@ -239,9 +253,9 @@ def _mkdir(directory: Path) -> None:
 def _value(path: Path, private) -> bytes:
     """Return the stored plaintext bytes of an entry; PRIVATE() supplies the key on demand."""
     data = path.read_bytes()
-    if data.startswith(MAGIC):
+    if data.startswith((MAGIC, LEGACY_MAGIC)):
         return _decrypt(data, path.name, private())
-    if data.startswith(RESERVED):
+    if _reserved(data):
         raise ValueError(f"unsupported ciphertext format: {path.name}")
     return data
 
@@ -260,8 +274,8 @@ def _set(directory: Path, name: str, data: bytes, encrypt: bool) -> None:
         _regular(path)
     if encrypt:
         data = _encrypt(data, name, _public(directory))
-    elif data.startswith(RESERVED):
-        raise ValueError(f"plaintext must not start with the reserved {RESERVED.decode()} prefix; use set -c")
+    elif _reserved(data):
+        raise ValueError("plaintext must not start with a reserved ciphertext prefix; use set -c")
     _atomic(path, data, 0o600)
 
 
@@ -281,9 +295,9 @@ def _transform(directory: Path, names: list[str], decrypt: bool, key: str | None
     for path in paths:
         _regular(path)
         data = path.read_bytes()
-        if data.startswith(MAGIC):
+        if data.startswith((MAGIC, LEGACY_MAGIC)):
             encrypted = True
-        elif data.startswith(RESERVED):
+        elif _reserved(data):
             raise ValueError(f"unsupported ciphertext format: {path.name}")
         else:
             encrypted = False
@@ -299,9 +313,9 @@ def _transform(directory: Path, names: list[str], decrypt: bool, key: str | None
         prepared = []
         for path, data in work:
             plain = _decrypt(data, path.name, private)
-            if plain.startswith(RESERVED):
+            if _reserved(plain):
                 # Restored plaintext would be misread as ciphertext; keep it encrypted.
-                raise ValueError(f"decrypted value starts with the reserved {RESERVED.decode()} prefix; kept encrypted: {path.name}")
+                raise ValueError(f"decrypted value starts with a reserved ciphertext prefix; kept encrypted: {path.name}")
             prepared.append((path, plain))
     else:
         public = _public(directory)
@@ -371,7 +385,7 @@ on failure.
 SET_HELP = """\
 Reads the value from stdin and stores it atomically (mode 0600). Without -c
 the exact bytes are stored as plaintext and no key is read; values starting
-with the reserved "envdirx:" prefix are refused, store them with -c. With -c
+with reserved "envdirx:" or "encrypted:" prefixes are refused; use -c. With -c
 the value is encrypted using only DIRECTORY/.envdirx.pub."""
 
 SELECT_HELP = """\

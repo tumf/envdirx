@@ -2,7 +2,7 @@
 
 [日本語版 README](README.ja.md)
 
-`envdirx` is a CLI that keeps the DJB `envdir` convention: one file per environment variable. `set` stores plaintext by default; `set -c` encrypts. Plaintext and encrypted entries can coexist, and `run` reads both. It serves a similar purpose to dotenvx, but its file format is **not compatible**.
+`envdirx` is a CLI that keeps the DJB `envdir` convention: one file per environment variable. `set` stores plaintext by default; `set -c` encrypts. Plaintext and encrypted entries can coexist, and `run` reads both. An encrypted entry named `GOG_KEYRING_PASSWORD` has printable `encrypted:B...` Base64 text inside its file, **not** a `GOG_KEYRING_PASSWORD=` line. Existing binary `envdirx:v1:` entries remain readable; new writes use the printable format. It serves a similar purpose to dotenvx, but its ciphertext and keys are **not compatible**.
 
 Requires Python 3.13 or newer on POSIX. The default envdir is `./.envs` relative to the current working directory. Put `-d/--directory DIRECTORY` **before** the subcommand. Only `mkdir` creates the envdir; other commands require it to exist.
 
@@ -47,9 +47,9 @@ Quote the `sh -c` program with single quotes so the calling shell does not expan
 
 ## Storing and reading values
 
-`set NAME` atomically stores stdin byte-for-byte as a mode-0600 plaintext file. It does not read a key or key pointer. Plaintext values beginning with `envdirx:` are reserved for the ciphertext format and are rejected with status 111 without changing the existing entry; use `set -c` for such values. `set -c NAME` needs only `.envdirx.pub`, not the private key.
+`set NAME` atomically stores stdin byte-for-byte as a mode-0600 plaintext file. It does not read a key or key pointer. Plaintext values beginning with `envdirx:` or `encrypted:` are reserved for ciphertext formats and are rejected with status 111 without changing the existing entry; use `set -c` for such values. `set -c NAME` needs only `.envdirx.pub`, not the private key.
 
-`get NAME` writes plaintext or the decrypted original bytes without adding a newline. Unlike `run`, it does not trim the first line or convert NUL bytes. Empty entries return zero bytes. **`get` can expose secrets to terminals and logs**; direct its output carefully. Missing or invalid entries, unsupported `envdirx:` formats, ciphertext bound to a different name, and invalid keys fail with status 111 and no value on stdout. `--key` overrides the pointer for encrypted entries only.
+`get NAME` writes plaintext or the decrypted original bytes without adding a newline. Unlike `run`, it does not trim the first line or convert NUL bytes. Empty entries return zero bytes. **`get` can expose secrets to terminals and logs**; direct its output carefully. Missing or invalid entries, unsupported `envdirx:` or `encrypted:` formats, ciphertext bound to a different name, and invalid keys fail with status 111 and no value on stdout. `--key` overrides the pointer for encrypted entries only.
 
 ## Encrypting and decrypting files
 
@@ -57,9 +57,9 @@ Both commands require either one or more names or `--all`. No target, mixing nam
 
 - `encrypt` changes plaintext files to encrypted files using only `.envdirx.pub`.
 - `decrypt` authenticates ciphertext and restores its original bytes, including newlines, NUL bytes and empty files, using only the private key. It does not require the public key. `--key` overrides `.envdirx.key`.
-- An explicitly named entry already in the requested state fails with status 111. `--all` skips entries already in that state and ignores dotfiles. If nothing needs conversion, it succeeds without reading a key. Unsupported or invalid `envdirx:` formats fail with status 111.
+- An explicitly named entry already in the requested state fails with status 111. `--all` skips entries already in that state and ignores dotfiles. If nothing needs conversion, it succeeds without reading a key. Unsupported or invalid `envdirx:` or `encrypted:` formats fail with status 111.
 
-**`decrypt` intentionally leaves secrets as plaintext on disk.** Back up sensitive files before converting, then verify the result. Atomic replacement does not securely erase prior plaintext or ciphertext from storage or backups. If a decrypted value begins with reserved prefix `envdirx:`, `decrypt` rejects the batch before writing anything (status 111) because `get`/`run` would misidentify that plaintext as ciphertext. For such a value, direct `get` output to a suitably protected file outside the envdir instead.
+**`decrypt` intentionally leaves secrets as plaintext on disk.** Back up sensitive files before converting, then verify the result. Atomic replacement does not securely erase prior plaintext or ciphertext from storage or backups. If a decrypted value begins with reserved prefix `envdirx:` or `encrypted:`, `decrypt` rejects the batch before writing anything (status 111) because `get`/`run` would misidentify that plaintext as ciphertext. For such a value, direct `get` output to a suitably protected file outside the envdir instead.
 
 All selected entries are read, validated, and transformed in memory before the first write. A missing or non-regular entry, invalid format or key, failed authentication, or reserved plaintext prefix leaves all entries unchanged (status 111). Each subsequent file replacement is atomic and mode 0600, but **the batch is not transactional**: if a later write fails, earlier successful replacements remain. Success writes nothing to stdout; errors contain names and paths, not values.
 

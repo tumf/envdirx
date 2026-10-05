@@ -141,6 +141,37 @@ class EnvdirxTest(unittest.TestCase):
         (directory / "TOKEN").write_bytes(b"envdirx:v2:\nunsafe")
         self.assertEqual(fx.on("run", "--", *SHOW).returncode, 111)
 
+    def test_encrypted_entries_are_printable_and_legacy_remains_readable(self):
+        import base64
+
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        stored = (fx.directory / "TOKEN").read_bytes()
+        self.assertRegex(stored, rb"\Aencrypted:B[A-Za-z0-9+/]+={0,2}\Z")
+        self.assertNotIn(SECRET, stored)
+        self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
+        legacy = b"envdirx:v1:\n" + base64.b64decode(stored[len(b"encrypted:B"):], validate=True)
+        (fx.directory / "TOKEN").write_bytes(legacy)
+        self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
+        self.assertEqual(fx.on("encrypt", "--all").returncode, 0)
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), legacy)
+        self.assertEqual(fx.on("decrypt", "TOKEN").returncode, 0)
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET + b"\n")
+
+    def test_malformed_printable_ciphertext_fails_without_disclosure(self):
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        original = (fx.directory / "TOKEN").read_bytes()
+        for bad in (b"encrypted:B!", b"encrypted:B", b"encrypted:future", original[:-2] + b"!!"):
+            with self.subTest(bad=bad):
+                (fx.directory / "TOKEN").write_bytes(bad)
+                result = fx.on("get", "TOKEN")
+                self.assertEqual(result.returncode, 111)
+                self.assertEqual(result.stdout, b"")
+                self.assertNotIn(SECRET, result.stderr)
+                self.assertEqual(fx.on("decrypt", "TOKEN").returncode, 111)
+                self.assertEqual((fx.directory / "TOKEN").read_bytes(), bad)
+
     def test_plaintext_only_run_needs_no_key_or_pointer(self):
         fx = Fixture(self)
         (fx.directory / "PLAIN").write_bytes(b"visible \n")
@@ -500,7 +531,7 @@ class TransformTest(unittest.TestCase):
         self.ok(fx, "encrypt", "LINES", "BIN", "EMPTY")
         for name in ("LINES", "BIN", "EMPTY"):
             stored = (fx.directory / name).read_bytes()
-            self.assertTrue(stored.startswith(b"envdirx:v1:\n"), name)
+            self.assertTrue(stored.startswith(b"encrypted:B"), name)
             if self.VALUES[name]:
                 self.assertNotIn(self.VALUES[name], stored)
             self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o600)
@@ -511,10 +542,10 @@ class TransformTest(unittest.TestCase):
         for name in ("EMPTY", "BIN"):
             self.assertEqual((fx.directory / name).read_bytes(), self.VALUES[name])
             self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o600)
-        self.assertTrue((fx.directory / "LINES").read_bytes().startswith(b"envdirx:v1:\n"))
+        self.assertTrue((fx.directory / "LINES").read_bytes().startswith(b"encrypted:B"))
         self.ok(fx, "encrypt", "--all")  # skips the already encrypted LINES
         for name in (*self.VALUES, "UNRELATED"):
-            self.assertTrue((fx.directory / name).read_bytes().startswith(b"envdirx:v1:\n"), name)
+            self.assertTrue((fx.directory / name).read_bytes().startswith(b"encrypted:B"), name)
         self.assertEqual(fx.on("get", "LINES").stdout, self.VALUES["LINES"])
         self.ok(fx, "decrypt", "--all")
         for name, value in {**self.VALUES, "UNRELATED": b"unrelated"}.items():
@@ -671,6 +702,9 @@ class TransformTest(unittest.TestCase):
                 self.assertIn(b"reserved", result.stderr)
                 self.assertNotIn(b"looks-encrypted", result.stderr)
         self.assertEqual(fx.on("get", "AAA").stdout, b"envdirx:v1:\nlooks-encrypted")
+        self.assertEqual(fx.on("set", "-c", "AAA", input=b"encrypted:Blooks-encrypted").returncode, 0)
+        self.assertIn(b"reserved", self.fails(fx, "decrypt", "AAA").stderr)
+        self.assertEqual(fx.on("get", "AAA").stdout, b"encrypted:Blooks-encrypted")
         self.ok(fx, "decrypt", "TOKEN")
         self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET)
 
@@ -795,7 +829,7 @@ class DirectoryWorkflowTest(unittest.TestCase):
     def test_plaintext_set_rejects_reserved_prefix_and_preserves_entry(self):
         fx = Fixture(self)
         (fx.directory / "TOKEN").write_bytes(b"old")
-        for value in (b"envdirx:", b"envdirx:v1:\nlooks-encrypted", b"envdirx:v9:\nx"):
+        for value in (b"envdirx:", b"envdirx:v1:\nlooks-encrypted", b"envdirx:v9:\nx", b"encrypted:Blooks-encrypted", b"encrypted:future"):
             with self.subTest(value=value):
                 result = fx.on("set", "TOKEN", input=value)
                 self.assertEqual(result.returncode, 111)
@@ -846,7 +880,7 @@ class DirectoryWorkflowTest(unittest.TestCase):
         self.assertEqual(fx.on("get", "PLAIN").stdout, b"visible")
         self.assertEqual(fx.on("set", "--encrypt", "TOKEN", input=SECRET).returncode, 0)
         self.assertNotIn(SECRET, (fx.directory / "TOKEN").read_bytes())
-        self.assertTrue((fx.directory / "TOKEN").read_bytes().startswith(b"envdirx:v1:\n"))
+        self.assertTrue((fx.directory / "TOKEN").read_bytes().startswith(b"encrypted:B"))
         self.assertEqual(fx.on("get", "--key", fx.root / "svc.key", "TOKEN").stdout, SECRET)
 
     def test_encrypted_set_get_run_roundtrip(self):
@@ -857,7 +891,7 @@ class DirectoryWorkflowTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(fx.on("set", "-c", "TOKEN", input=value).returncode, 0)
                 stored = (fx.directory / "TOKEN").read_bytes()
-                self.assertTrue(stored.startswith(b"envdirx:v1:\n"))
+                self.assertTrue(stored.startswith(b"encrypted:B"))
                 if value:
                     self.assertNotIn(value, stored)
                 self.assertEqual((fx.directory / "TOKEN").stat().st_mode & 0o777, 0o600)
