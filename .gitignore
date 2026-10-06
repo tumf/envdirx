@@ -11,3 +11,6 @@ wheels/
 
 # Never commit private keys
 *.key
+
+# Local agent instructions must not be published
+.agents/
