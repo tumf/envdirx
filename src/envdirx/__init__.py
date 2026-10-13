@@ -252,7 +252,7 @@ def _make_key_store(folder: Path, envdir: Path) -> Path:
     try:
         resolved = existing.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise ValueError(f"cannot resolve default key directory {existing}: {exc.strerror or exc}") from None
+        raise ValueError(f"cannot resolve default key directory {existing}: {exc}") from None
     if not resolved.is_dir():
         raise ValueError(f"not a directory: {existing}")
     target = resolved.joinpath(*reversed(missing))

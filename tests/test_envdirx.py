@@ -1532,6 +1532,22 @@ class DefaultKeyDirectoryTest(unittest.TestCase):
         self.assertEqual(self.main(fx, {"HOME": str(fx.home)}, [homeless]), 111)
         self.assertEqual(fx.snapshot(), before)
 
+    def test_resolve_runtime_error_exits_111(self):
+        fx = Fixture(self)
+        xdg = fx.root / "xdg"
+        xdg.mkdir()
+        before = fx.snapshot()
+        resolve = Path.resolve
+
+        def fail_store(path, *args, **kwargs):
+            if path == xdg:
+                raise RuntimeError("Symlink loop")
+            return resolve(path, *args, **kwargs)
+
+        patch = mock.patch.object(envdirx.Path, "resolve", fail_store)
+        self.assertEqual(self.main(fx, {"XDG_DATA_HOME": str(xdg)}, [patch]), 111)
+        self.assertEqual(fx.snapshot(), before)
+
     def test_fingerprint_collision_preserves_existing_key(self):
         fx = Fixture(self)
         fixed = X25519PrivateKey.generate()
