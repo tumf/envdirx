@@ -266,6 +266,17 @@ def _get(directory: Path, key: str | None, name: str) -> bytes:
     _regular(path)
     return _value(path, lambda: _private(directory, key))
 
+def _get_first(directories: list[Path], key: str | None, name: str) -> bytes:
+    _name(name)
+    for directory in directories:
+        if not directory.is_dir():
+            raise ValueError(f"not a directory: {directory}")
+        path = directory / name
+        if not os.path.lexists(path):
+            continue
+        return _get(directory, key, name)
+    raise ValueError(f"missing entry: {name}")
+
 
 def _set(directory: Path, name: str, data: bytes, encrypt: bool) -> None:
     _name(name)
@@ -353,7 +364,7 @@ global too: it prints the installed version and reads no envdir.
   envdirx [-d DIR] mkdir
   envdirx [-d DIR] keygen (-k KEYFILE | -K KEYDIR)
   envdirx [-d DIR] set [-c] NAME          < value
-  envdirx [-d DIR] get [--key KEY] NAME
+  envdirx [-d DIR ...] get [--key KEY] NAME
   envdirx [-d DIR] encrypt (NAME [NAME ...] | --all)
   envdirx [-d DIR] decrypt [--key KEY] (NAME [NAME ...] | --all)
   envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]"""
@@ -378,7 +389,9 @@ GET_HELP = """\
 Writes the stored value to stdout exactly: the plaintext bytes, or the
 decrypted original bytes. No newline is added and no envdir trimming is
 applied. This deliberately discloses a secret; nothing is written to stdout
-on failure.
+on failure. Repeat -d before get to search directories in priority order;
+the first existing entry wins. Missing entries are skipped, but an invalid
+directory or entry fails without falling back to a lower-priority value.
 
 """ + KEY_HELP
 
@@ -426,7 +439,7 @@ leading ~/ expands. Existing files are never overwritten (no force option)."""
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(prog="envdirx", description=DESCRIPTION, formatter_class=text)
-    parser.add_argument("-d", "--directory", dest="envdir", type=Path, metavar="DIRECTORY", help="envdir (default: ./.envs); must precede the subcommand")
+    parser.add_argument("-d", "--directory", dest="envdirs", type=Path, action="append", metavar="DIRECTORY", help="envdir (default: ./.envs); repeat for get priority order; must precede the subcommand")
     parser.add_argument("-V", "--version", action="version", version=importlib.metadata.version("envdirx"), help="print the installed version and exit; global like -d")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("mkdir", help="create the envdir (mode 0700) and missing parents")
@@ -450,7 +463,10 @@ def main() -> None:
     run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
     args = parser.parse_args()
-    directory = args.envdir if args.envdir is not None else Path(DEFAULT_DIRECTORY)
+    directories = args.envdirs or [Path(DEFAULT_DIRECTORY)]
+    directory = directories[0]
+    if args.action != "get" and len(directories) > 1:
+        parser.error("multiple -d directories are supported only for get")
     if args.action == "run" and (args.command[:1] != ["--"] or len(args.command) < 2):
         run.error("expected -- COMMAND [ARGS...]")
     if args.action in ("encrypt", "decrypt"):
@@ -460,6 +476,11 @@ def main() -> None:
         if len(set(args.names)) != len(args.names):
             transform.error("duplicate entry name")
     try:
+        if args.action == "get":
+            value = _get_first(directories, args.key, args.name)
+            sys.stdout.buffer.write(value)
+            sys.stdout.buffer.flush()
+            return
         if args.action == "mkdir":
             _mkdir(directory)
             return
@@ -471,10 +492,6 @@ def main() -> None:
             _transform(directory, args.names, args.action == "decrypt", getattr(args, "key", None))
         elif args.action == "set":
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
-        elif args.action == "get":
-            value = _get(directory, args.key, args.name)
-            sys.stdout.buffer.write(value)
-            sys.stdout.buffer.flush()
         else:
             _run(directory, args.key, args.command[1:])
     except (OSError, ValueError) as exc:

@@ -107,6 +107,50 @@ class Fixture:
 
 
 class EnvdirxTest(unittest.TestCase):
+    def test_get_searches_directories_in_order(self):
+        fx = Fixture(self)
+        second = fx.root / "second"
+        second.mkdir()
+        (second / "TOKEN").write_bytes(b"fallback")
+        def get(*dirs, name="TOKEN"):
+            return fx.call(*(arg for directory in dirs for arg in ("-d", directory)), "get", name)
+
+        result = get(fx.directory, second)
+        self.assertEqual((result.returncode, result.stdout), (0, b"fallback"))
+        (fx.directory / "TOKEN").write_bytes(b"primary")
+        result = get(fx.directory, second)
+        self.assertEqual((result.returncode, result.stdout), (0, b"primary"))
+        (fx.directory / "TOKEN").write_bytes(b"")
+        result = get(fx.directory, second)
+        self.assertEqual((result.returncode, result.stdout), (0, b""))
+        (fx.directory / "TOKEN").write_bytes(b"encrypted:invalid")
+        result = get(fx.directory, second)
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+        (fx.directory / "TOKEN").unlink()
+        (fx.directory / "TOKEN").symlink_to(second / "TOKEN")
+        result = get(fx.directory, second)
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+        (fx.directory / "TOKEN").unlink()
+        self.assertEqual((get(fx.root / "missing", second).returncode, get(fx.directory, second, name="ABSENT").returncode), (111, 111))
+        self.assertEqual(get(fx.directory, second, name="../TOKEN").returncode, 111)
+        result = fx.call("-d", fx.directory, "-d", second, "set", "TOKEN", input=b"no")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual((second / "TOKEN").read_bytes(), b"fallback")
+
+    def test_get_uses_selected_directory_pointer(self):
+        fx = Fixture(self)
+        second = fx.root / "second"
+        second.mkdir()
+        self.assertEqual(fx.on("keygen", "-k", fx.root / "key").returncode, 0)
+        (second / ".envdirx.pub").write_bytes((fx.directory / ".envdirx.pub").read_bytes())
+        (second / ".envdirx.key").symlink_to(fx.root / "key")
+        self.assertEqual(fx.on("set", "-c", "TOKEN", input=SECRET, directory=second).returncode, 0)
+        result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (0, SECRET))
+        (second / ".envdirx.key").unlink()
+        result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+
     def test_encrypted_and_plain_envdir_semantics(self):
         fx = Fixture(self)
         directory = fx.directory

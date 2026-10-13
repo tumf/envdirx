@@ -31,7 +31,7 @@ After publication, install with `uv tool install envdirx` and replace `uv run en
 | `envdirx [-d D] mkdir` | Create the envdir and missing parents; a new envdir has mode 0700. An existing directory is left unchanged; a non-directory fails with status 111. |
 | `envdirx [-d D] keygen (-k KEYFILE \| -K KEYDIR)` | Create a key pair and the `.envdirx.key` symlink. |
 | `envdirx [-d D] set [-c] NAME` | Store stdin unchanged as plaintext, or encrypt with `-c`. |
-| `envdirx [-d D] get [--key KEY] NAME` | Write the original bytes to stdout. |
+| `envdirx [-d D ...] get [--key KEY] NAME` | Search envdirs in priority order and write the first entry’s original bytes to stdout. |
 | `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)` | Encrypt existing plaintext entries in place, using only the public key. |
 | `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)` | Restore encrypted entries to plaintext files, using the private key. |
 | `envdirx [-d D] run [--key KEY] -- COMMAND [ARGS...]` | Execute a command with the envdir applied. |
@@ -51,7 +51,7 @@ Quote the `sh -c` program with single quotes so the calling shell does not expan
 
 `set NAME` atomically stores stdin byte-for-byte as a mode-0600 plaintext file. It does not read a key or key pointer. Plaintext values beginning with `envdirx:` or `encrypted:` are reserved for ciphertext formats and are rejected with status 111 without changing the existing entry; use `set -c` for such values. `set -c NAME` needs only `.envdirx.pub`, not the private key.
 
-`get NAME` writes plaintext or the decrypted original bytes without adding a newline. Unlike `run`, it does not trim the first line or convert NUL bytes. Empty entries return zero bytes. **`get` can expose secrets to terminals and logs**; direct its output carefully. Missing or invalid entries, unsupported `envdirx:` or `encrypted:` formats, ciphertext bound to a different name, and invalid keys fail with status 111 and no value on stdout. `--key` overrides the pointer for encrypted entries only.
+`get NAME` writes plaintext or the decrypted original bytes without adding a newline. Repeat `-d` before `get` to search directories in priority order: absent entries are skipped, but an empty entry wins. The selected directory supplies its own key pointer unless `--key` is given. Missing directories, invalid entries, and decryption errors stop the search rather than falling back. Repeated `-d` on other commands fails with status 2. Example: `envdirx -d ./local.env -d ./shared.env get API_TOKEN | wc -c`. Unlike `run`, it does not trim the first line or convert NUL bytes. Empty entries return zero bytes. **`get` can expose secrets to terminals and logs**; direct its output carefully. Missing or invalid entries, unsupported `envdirx:` or `encrypted:` formats, ciphertext bound to a different name, and invalid keys fail with status 111 and no value on stdout. `--key` overrides the pointer for encrypted entries only.
 
 ## Encrypting and decrypting files
 

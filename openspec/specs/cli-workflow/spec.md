@@ -1,5 +1,5 @@
 ### Requirement: Directory-oriented command grammar
-CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt, decrypt and run. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Init SHALL NOT be a recognized subcommand, and SHALL fail parsing without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
+CLI SHALL use global -d/--directory before subcommand with cwd-relative default ./.envs for mkdir, keygen, set, get, encrypt, decrypt and run. Only get MAY repeat -d for ordered lookup. Run SHALL require -- before command, preserve child flags and DJB semantics and exit codes. Init SHALL NOT be a recognized subcommand, and SHALL fail parsing without writes. Positional directories for set/encrypt/run SHALL no longer be accepted as such.
 
 #### Scenario: Default and explicit directories
 - **WHEN** mkdir followed by plaintext set AAA, get AAA and run -- sh -c 'test -n "$AAA"' execute with default or explicit -d
@@ -16,6 +16,13 @@ CLI SHALL use global -d/--directory before subcommand with cwd-relative default 
 #### Scenario: Decrypt directory selection
 - **WHEN** decrypt NAME executes with default or explicit -d
 - **THEN** only the selected envdir entry is converted
+
+### Requirement: Ordered get directory lookup
+Get SHALL accept repeated global `-d/--directory` options before the subcommand and search them in argument order; absent entries are skipped and the first existing entry wins, including an empty file. With no `-d`, get SHALL use `./.envs`. The selected encrypted entry SHALL use its own directory's key pointer unless `--key` overrides it. Invalid names, missing or non-directory paths encountered during the search, nonregular or malformed entries, and decryption failure SHALL stop with exit 111 and empty stdout rather than falling back. If the name is absent everywhere, exit 111. Other subcommands SHALL reject repeated `-d` with exit 2 and no writes.
+
+#### Scenario: Priority and failure
+- **WHEN** get searches two envdirs and the first has no named entry
+- **THEN** it returns the second entry's original bytes; if the first has an empty entry it returns zero bytes instead, and if the first has a malformed entry it fails without consulting the second
 
 ### Requirement: Safe external key generation
 Keygen SHALL require exactly one of -k/--key filename or -K/--key-dir existing directory, no force flag, no overwrite. -K SHALL name key SHA256(raw public key) as full lowercase hex plus .key. It SHALL write external private key 0600, regular public key 0644 and absolute-target .envdirx.key symlink, preflight all collisions including dangling links, reject resolved in-envdir key destinations and cleanup only newly created artifacts on failure.
