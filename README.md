@@ -14,9 +14,8 @@ Install the published CLI:
 
 ```sh
 uv tool install envdirx
-mkdir -p ~/.envdirx-keys
 envdirx mkdir
-envdirx keygen -K ~/.envdirx-keys
+envdirx keygen
 printf 'plain-value' | envdirx set AAA
 printf 'example-token' | envdirx set -c API_TOKEN
 envdirx get AAA > /dev/null
@@ -29,7 +28,7 @@ Do not put real secrets on a shell command line: supply them from a file or stan
 | --- | --- |
 | `envdirx --version` / `envdirx -V` | Print the installed envdirx version and one newline, then exit 0. Like `-d`, it goes before any subcommand and needs no envdir or key. |
 | `envdirx [-d D] mkdir` | Create the envdir and missing parents; a new envdir has mode 0700. An existing directory is left unchanged; a non-directory fails with status 111. |
-| `envdirx [-d D] keygen (-k KEYFILE \| -K KEYDIR)` | Create a key pair and the `.envdirx.key` symlink. |
+| `envdirx [-d D] keygen [-k KEYFILE \| -K KEYDIR]` | Create a key pair and the `.envdirx.key` symlink; without options the private key goes to the default key directory. |
 | `envdirx [-d D] set [-c] NAME` | Store stdin unchanged as plaintext, or encrypt with `-c`. |
 | `envdirx [-d D ...] get [--key KEY] NAME` | Search envdirs in priority order and write the first entry’s original bytes to stdout. |
 | `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)` | Encrypt existing plaintext entries in place, using only the public key. |
@@ -88,9 +87,11 @@ Do not run `decrypt` on real data unless restoring those specified files to plai
 
 ## Keys and `.envdirx.key`
 
-`keygen` creates a mode-0600 private key outside the envdir, a mode-0644 raw 32-byte public key at `.envdirx.pub`, and a symlink `.envdirx.key` pointing to the fully resolved absolute private-key path. `-k KEYFILE` selects an exact file; `-K KEYDIR` stores the private key in an existing directory as `<lowercase SHA-256 of raw public key>.key`. Exactly one is required. Relative key destinations are relative to the current directory; leading `~/` expands to home.
+`keygen` creates a mode-0600 private key outside the envdir, a mode-0644 raw 32-byte public key at `.envdirx.pub`, and a symlink `.envdirx.key` pointing to the fully resolved absolute private-key path. `-k KEYFILE` selects an exact file; `-K KEYDIR` stores the private key in an existing directory as `<lowercase SHA-256 of raw public key>.key`. They are mutually exclusive. Relative key destinations are relative to the current directory; leading `~/` expands to home.
 
-It never overwrites a private key, public key, or pointer (including broken symlinks); there is no `-f/--force` or rotation command. It does not create the key's parent directory, refuses a private-key destination inside the resolved envdir, and removes only files it created if an operation fails. **Never put the private key in the repository, envdir, or a distribution. Back it up separately: losing it makes encrypted values unrecoverable.**
+With neither option, the private key is stored as `<lowercase SHA-256 of raw public key>.key` in the default key directory: `$XDG_DATA_HOME/envdirx/keys` when `XDG_DATA_HOME` is a non-empty absolute path, otherwise `$HOME/.local/share/envdirx/keys` (an unset, empty, or relative `XDG_DATA_HOME` is ignored, and a literal `~` in it is not expanded). Only this default directory is created when missing: each new directory, including missing parents, gets mode 0700 regardless of umask, and existing directories keep their modes. Before anything is created, the resolved default directory must lie outside the resolved envdir (symlink aliases included); a non-directory, broken or cyclic symlink, or filesystem error fails with status 111 and writes no key, public key, or pointer. `-k` and `-K` never consult the default, and `-K` never creates its directory. Reading (`get`, `run`, `decrypt`) uses only the envdir's pointer or `--key`, so changing `XDG_DATA_HOME` later does not move or hide existing keys, and nothing scans or migrates the key directory.
+
+It never overwrites a private key, public key, or pointer (including broken symlinks); there is no `-f/--force` or rotation command. Apart from the default key directory, it does not create the key's parent directory. It refuses a private-key destination inside the resolved envdir and removes only files it created if an operation fails (a newly created, empty default key directory may remain). **Never put the private key in the repository, envdir, or a distribution. Back it up separately: losing it makes encrypted values unrecoverable.**
 
 `run` and `get` read the private key only for encrypted entries. `--key` takes precedence over the pointer; its relative paths use the current directory and leading `~/` expands to home. Without it, only `.envdirx.key` is consulted—there is no fallback to a nearby key. A plaintext-only envdir needs neither a key nor a pointer.
 

@@ -11,6 +11,8 @@ class PublicSkillTest(unittest.TestCase):
         self.assertTrue(text.startswith("---\nname: envdirx\n"))
         self.assertIn("README.md", text)
         self.assertIn("set -c", text)
+        self.assertIn("~/.local/share/envdirx/keys", text)
+        self.assertIn("XDG_DATA_HOME", text)
         self.assertNotIn("/Users/", text)
         self.assertNotIn(".agents/", text)
 
