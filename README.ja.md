@@ -6,15 +6,17 @@ envdir は `-d/--directory DIRECTORY` で指定し、**サブコマンドより�
 
 [MIT License](LICENSE)で配布します。
 
+## インストールとクイックスタート
+
 ```sh
-uv sync
+uv tool install envdirx
 mkdir -p ~/.envdirx-keys
-uv run envdirx mkdir
-uv run envdirx keygen -K ~/.envdirx-keys
-printf 'plain-value' | uv run envdirx set AAA
-printf 'example-token' | uv run envdirx set -c API_TOKEN
-uv run envdirx get AAA > /dev/null
-uv run envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
+envdirx mkdir
+envdirx keygen -K ~/.envdirx-keys
+printf 'plain-value' | envdirx set AAA
+printf 'example-token' | envdirx set -c API_TOKEN
+envdirx get AAA > /dev/null
+envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 ```
 
 | コマンド | 動作 |
@@ -31,10 +33,10 @@ uv run envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 明示的なディレクトリと鍵ファイルを使う例:
 
 ```sh
-uv run envdirx -d service.env mkdir
-uv run envdirx -d service.env keygen -k "$HOME/service.env.key"
-printf 'example-token\n' | uv run envdirx -d service.env set -c API_TOKEN
-uv run envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TOKEN" = example-token'
+envdirx -d service.env mkdir
+envdirx -d service.env keygen -k "$HOME/service.env.key"
+printf 'example-token\n' | envdirx -d service.env set -c API_TOKEN
+envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TOKEN" = example-token'
 ```
 
 値はシェルの引数ではなく標準入力から渡す。例の `sh -c '...'` は単一引用符で囲み、変数を呼び出し側のシェルで展開しない。
@@ -61,24 +63,24 @@ uv run envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "
 選択したエントリはすべて、最初の書き込みの前に読み込み・検証・変換をメモリ上で済ませる。エントリの欠落・通常ファイル以外・未対応フォーマット・鍵の不正・復号失敗・予約済みプレフィックスのどれかがあれば、何も変更せずに 111 で失敗する。その後、各エントリを個別にアトミック置換する（0600）。**バッチ全体のトランザクションではない**: 途中の書き込みで失敗した場合、それまでに置換したエントリは変換済みのまま残り、失敗したエントリは元のバイト列のまま 111 で終了する。成功時の標準出力は空で、エラーメッセージには名前とパスだけが含まれる。
 
 ```sh
-printf 'old-plain' | uv run envdirx -d service.env set DB_PASSWORD
-uv run envdirx -d service.env encrypt --all
-uv run envdirx -d service.env run --key "$PWD/service.env.key" -- sh -c 'test "$DB_PASSWORD" = old-plain'
+printf 'old-plain' | envdirx -d service.env set DB_PASSWORD
+envdirx -d service.env encrypt --all
+envdirx -d service.env run --key "$PWD/service.env.key" -- sh -c 'test "$DB_PASSWORD" = old-plain'
 ```
 
 指定した名前だけを変換し、平文へ戻す例:
 
 ```sh
-uv run envdirx -d app.env mkdir
-uv run envdirx -d app.env keygen -k "$PWD/app.env.key"
-printf 'db-secret' | uv run envdirx -d app.env set DB_PASSWORD
-printf 'visible' | uv run envdirx -d app.env set LOG_LEVEL
-uv run envdirx -d app.env encrypt DB_PASSWORD
+envdirx -d app.env mkdir
+envdirx -d app.env keygen -k "$PWD/app.env.key"
+printf 'db-secret' | envdirx -d app.env set DB_PASSWORD
+printf 'visible' | envdirx -d app.env set LOG_LEVEL
+envdirx -d app.env encrypt DB_PASSWORD
 test "$(cut -c 1-11 app.env/DB_PASSWORD)" = 'encrypted:B'
-uv run envdirx -d app.env decrypt DB_PASSWORD
+envdirx -d app.env decrypt DB_PASSWORD
 test "$(cat app.env/DB_PASSWORD)" = db-secret
-uv run envdirx -d app.env encrypt --all
-uv run envdirx -d app.env decrypt --key "$PWD/app.env.key" --all
+envdirx -d app.env encrypt --all
+envdirx -d app.env decrypt --key "$PWD/app.env.key" --all
 test "$(cat app.env/LOG_LEVEL)" = visible
 ```
 
@@ -87,20 +89,20 @@ test "$(cat app.env/LOG_LEVEL)" = visible
 `get NAME` は平文ならそのバイト列、暗号文なら復号した元のバイト列を標準出力へ書く。`-d` をサブコマンドの前に複数指定すると、その順に探索する。存在しない名前は次へ進み、最初に存在するエントリを使う（空ファイルも優先）。選択した暗号文にはそのディレクトリの `.envdirx.key` を使い、`--key` 指定時はそれを優先する。途中のディレクトリの欠落、見つかったエントリの不正・復号失敗では後続へフォールバックせず 111 で失敗する。複数の `-d` は `get` 以外では使えない（終了コード 2）。
 
 ```sh
-uv run envdirx -d ./local.env mkdir
-uv run envdirx -d ./shared.env mkdir
-printf 'example-token' | uv run envdirx -d ./shared.env set API_TOKEN
-uv run envdirx -d ./local.env -d ./shared.env get API_TOKEN > /dev/null
-printf 'local-token' | uv run envdirx -d ./local.env set API_TOKEN
-test "$(uv run envdirx -d ./local.env -d ./shared.env get API_TOKEN)" = local-token
+envdirx -d ./local.env mkdir
+envdirx -d ./shared.env mkdir
+printf 'example-token' | envdirx -d ./shared.env set API_TOKEN
+envdirx -d ./local.env -d ./shared.env get API_TOKEN > /dev/null
+printf 'local-token' | envdirx -d ./local.env set API_TOKEN
+test "$(envdirx -d ./local.env -d ./shared.env get API_TOKEN)" = local-token
 ```
 
 改行を追加せず、`run` のような先頭行・末尾空白・NUL の変換もしない。空のエントリは0バイトを出力して成功する。**これは利用者の要求による明示的な秘密の表示**なので、端末やログに残る場所では使わないこと。エラーメッセージに値が含まれることはない。エントリがない・不正・未対応の `envdirx:` フォーマット・名前が一致しない暗号文・鍵が不正なときは、標準出力に何も書かず 111 で失敗する。`--key` は暗号化エントリにだけ使われ、ポインタより優先される。
 
 ```sh
-uv run envdirx -d service.env mkdir
-printf 'line\n' | uv run envdirx -d service.env set GREETING
-test "$(uv run envdirx -d service.env get GREETING | od -An -c | tr -d ' ')" = 'line\n'
+envdirx -d service.env mkdir
+printf 'line\n' | envdirx -d service.env set GREETING
+test "$(envdirx -d service.env get GREETING | od -An -c | tr -d ' ')" = 'line\n'
 ```
 
 ## 鍵と `.envdirx.key` ポインタ
@@ -127,7 +129,7 @@ test "$(uv run envdirx -d service.env get GREETING | od -An -c | tr -d ' ')" = '
 ```sh
 printf '%s\n' "$PWD/service.env.key" > service.env/.envdirx.key
 chmod 600 service.env/.envdirx.key
-uv run envdirx -d service.env run -- true
+envdirx -d service.env run -- true
 ```
 
 シンボリックリンクにする場合:
@@ -135,7 +137,7 @@ uv run envdirx -d service.env run -- true
 ```sh
 rm -f service.env/.envdirx.key
 ln -s ../service.env.key service.env/.envdirx.key
-uv run envdirx -d service.env run -- true
+envdirx -d service.env run -- true
 ```
 
 `.gitignore` の `*.key` はポインタ `.envdirx.key` にも一致するので、ポインタもコミットされない。秘密鍵を守るこの除外は弱めないこと。**シンボリックリンクのポインタには注意**: `tar -h`、`rsync -L`、`cp -L` などリンクを辿るコピーやアーカイブで envdir を配布すると、ポインタの代わりに秘密鍵の中身がそのまま同梱される。配布する envdir には通常ファイルのポインタを使うか、`.envdirx.key` を除外する。
@@ -167,7 +169,8 @@ uv run envdirx -d service.env run -- true
 `run` は `--` の後をすべて子コマンドとして扱うので、子コマンドのフラグ（`-d`、`--key` など）は envdirx に解釈されない。`--` は必須で、`--key` は `--` より前に置く。`--` またはコマンドがなければ子プロセスを起動せずに失敗する。`run` はコマンドへ exec し終了コードを引き継ぐ。DJB方式に従い0バイトのエントリは環境変数を削除し、非空エントリは最初の行の末尾空白・タブを除去、NUL を改行へ変換する。暗号文は X25519 のエフェメラル鍵と ChaCha20-Poly1305 で暗号化し、ファイル名に認証を結びつける。`envdirx` は dotenvx と同じ**用途**だが、互換フォーマットではない。
 
 ```sh
-uv run python -m unittest discover -s tests -v
+uv sync
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 `ponytail:` 現状はローカル POSIX 環境向け。敵対的なユーザーが同時にディレクトリを書き換えられる環境には対応しない。必要になったら dirfd を使った競合耐性と鍵管理を追加する。

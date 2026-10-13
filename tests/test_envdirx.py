@@ -513,7 +513,7 @@ class EnvdirxTest(unittest.TestCase):
             self.assertNotIn(b"unused", fx.call(action, "--help").stdout)
 
     def test_readme_commands(self):
-        """Run every README ``sh`` block, with ``uv run envdirx`` bound to this checkout."""
+        """Run every README ``sh`` block with an installed-CLI shim for this checkout."""
         readme = (ROOT / "README.md").read_text()
         blocks = [b for document in (readme, (ROOT / "README.ja.md").read_text())
                   for b in re.findall(r"```sh\n(.*?)```", document, re.S)
@@ -548,12 +548,15 @@ class EnvdirxTest(unittest.TestCase):
                 fx.directory.rmdir()
                 bin_dir = fx.root / "bin"
                 bin_dir.mkdir()
-                shim = bin_dir / "uv"
-                shim.write_text(f'#!/bin/sh\n[ "$1" = sync ] && exit 0\n[ "$1 $2" = "run envdirx" ] || exit 99\nshift 2\nexec {sys.executable} -m envdirx "$@"\n')
+                shim = bin_dir / "envdirx"
+                shim.write_text(f'#!/bin/sh\nexec {sys.executable} -m envdirx "$@"\n')
                 shim.chmod(0o755)
+                uv_shim = bin_dir / "uv"
+                uv_shim.write_text('#!/bin/sh\n[ "$1 $2 $3" = "tool install envdirx" ] || exit 99\n')
+                uv_shim.chmod(0o755)
                 # Blocks that do not create their own envdir start from a legacy one:
                 # adjacent key, encrypted entry, no pointer.
-                legacy = "uv run envdirx -d service.env mkdir\nuv run envdirx -d service.env keygen -k service.env.key\nprintf s | uv run envdirx -d service.env set -c API_TOKEN\nrm service.env/.envdirx.key\n"
+                legacy = "envdirx -d service.env mkdir\nenvdirx -d service.env keygen -k service.env.key\nprintf s | envdirx -d service.env set -c API_TOKEN\nrm service.env/.envdirx.key\n"
                 creates = any(word in block for word in ("keygen", "mkdir"))
                 prelude = "set -eu\n" + ("" if creates else legacy)
                 env = {**fx.env, "PATH": f"{bin_dir}:{os.environ['PATH']}"}

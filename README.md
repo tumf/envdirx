@@ -10,20 +10,20 @@ Licensed under the [MIT License](LICENSE).
 
 ## Install and quick start
 
-From this repository, while preparing the first PyPI release:
+Install the published CLI:
 
 ```sh
-uv sync
+uv tool install envdirx
 mkdir -p ~/.envdirx-keys
-uv run envdirx mkdir
-uv run envdirx keygen -K ~/.envdirx-keys
-printf 'plain-value' | uv run envdirx set AAA
-printf 'example-token' | uv run envdirx set -c API_TOKEN
-uv run envdirx get AAA > /dev/null
-uv run envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
+envdirx mkdir
+envdirx keygen -K ~/.envdirx-keys
+printf 'plain-value' | envdirx set AAA
+printf 'example-token' | envdirx set -c API_TOKEN
+envdirx get AAA > /dev/null
+envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 ```
 
-After publication, install with `uv tool install envdirx` and replace `uv run envdirx` with `envdirx`. Do not put real secrets on a shell command line: supply them from a file or standard input instead of `printf` literals.
+Do not put real secrets on a shell command line: supply them from a file or standard input instead of `printf` literals.
 
 | Command | Action |
 | --- | --- |
@@ -39,10 +39,10 @@ After publication, install with `uv tool install envdirx` and replace `uv run en
 For an explicit directory and key file:
 
 ```sh
-uv run envdirx -d service.env mkdir
-uv run envdirx -d service.env keygen -k "$HOME/service.env.key"
-printf 'example-token\n' | uv run envdirx -d service.env set -c API_TOKEN
-uv run envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TOKEN" = example-token'
+envdirx -d service.env mkdir
+envdirx -d service.env keygen -k "$HOME/service.env.key"
+printf 'example-token\n' | envdirx -d service.env set -c API_TOKEN
+envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TOKEN" = example-token'
 ```
 
 Quote the `sh -c` program with single quotes so the calling shell does not expand the variables.
@@ -66,22 +66,22 @@ Both commands require either one or more names or `--all`. No target, mixing nam
 All selected entries are read, validated, and transformed in memory before the first write. A missing or non-regular entry, invalid format or key, failed authentication, or reserved plaintext prefix leaves all entries unchanged (status 111). Each subsequent file replacement is atomic and mode 0600, but **the batch is not transactional**: if a later write fails, earlier successful replacements remain. Success writes nothing to stdout; errors contain names and paths, not values.
 
 ```sh
-printf 'old-plain' | uv run envdirx -d service.env set DB_PASSWORD
-uv run envdirx -d service.env encrypt --all
-uv run envdirx -d service.env run --key "$PWD/service.env.key" -- sh -c 'test "$DB_PASSWORD" = old-plain'
+printf 'old-plain' | envdirx -d service.env set DB_PASSWORD
+envdirx -d service.env encrypt --all
+envdirx -d service.env run --key "$PWD/service.env.key" -- sh -c 'test "$DB_PASSWORD" = old-plain'
 ```
 
 To target one entry and restore it afterward:
 
 ```sh
-uv run envdirx -d app.env mkdir
-uv run envdirx -d app.env keygen -k "$PWD/app.env.key"
-printf 'db-secret' | uv run envdirx -d app.env set DB_PASSWORD
-printf 'visible' | uv run envdirx -d app.env set LOG_LEVEL
-uv run envdirx -d app.env encrypt DB_PASSWORD
-uv run envdirx -d app.env decrypt DB_PASSWORD
-uv run envdirx -d app.env encrypt --all
-uv run envdirx -d app.env decrypt --key "$PWD/app.env.key" --all
+envdirx -d app.env mkdir
+envdirx -d app.env keygen -k "$PWD/app.env.key"
+printf 'db-secret' | envdirx -d app.env set DB_PASSWORD
+printf 'visible' | envdirx -d app.env set LOG_LEVEL
+envdirx -d app.env encrypt DB_PASSWORD
+envdirx -d app.env decrypt DB_PASSWORD
+envdirx -d app.env encrypt --all
+envdirx -d app.env decrypt --key "$PWD/app.env.key" --all
 ```
 
 Do not run `decrypt` on real data unless restoring those specified files to plaintext is intended.
@@ -101,7 +101,7 @@ For an older envdir using a neighboring `service.env.key`, add a pointer without
 ```sh
 printf '%s\n' "$PWD/service.env.key" > service.env/.envdirx.key
 chmod 600 service.env/.envdirx.key
-uv run envdirx -d service.env run -- true
+envdirx -d service.env run -- true
 ```
 
 Alternatively, if the pointer does not already exist, use `ln -s ../service.env.key service.env/.envdirx.key`. The `*.key` rule in `.gitignore` also excludes `.envdirx.key`; do not weaken it. **Copies that follow symlinks (`tar -h`, `rsync -L`, `cp -L`) can package the private key instead of the pointer.** Exclude `.envdirx.key` from distributions or use a regular-file pointer.
@@ -129,7 +129,8 @@ Releases are manual and use semantic `MAJOR.MINOR.PATCH` versions. Before 1.0, i
 `run` requires `--` followed by a command. Arguments after `--`, even `-d` and `--key`, belong to the child command. Put envdirx's `--key` before `--`. Missing `--` or command fails without starting a child. `run` execs the command and inherits its exit status. Following DJB semantics, a zero-byte entry unsets the variable; a nonempty entry uses only the first line, strips trailing spaces and tabs, and converts NUL bytes to newlines. Ciphertext uses an ephemeral X25519 key and ChaCha20-Poly1305; authentication binds the entry to its filename.
 
 ```sh
-uv run python -m unittest discover -s tests -v
+uv sync
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 `ponytail:` This is currently for local POSIX environments. It does not defend against another user changing the directory concurrently; add dirfd-based race protection and stronger key management if that threat becomes relevant.
