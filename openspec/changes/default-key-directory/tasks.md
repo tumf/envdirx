@@ -1,0 +1,5 @@
+## Implementation
+- [ ] 1. Implement optional default destination selection and safe lazy creation. verification-id: key-directory-contract (verification: integration: uv run python -m unittest discover -s tests -v; tests/test_envdirx.py)
+- [ ] 2. Add isolated default/override/security/failure regression cases and update obsolete required-destination tests. verification-id: key-directory-contract (verification: integration: uv run python -m unittest discover -s tests -v; tests/test_envdirx.py)
+- [ ] 3. Align CLI help, bilingual README, public skill, and canonical specification while preserving other requirements. verification-id: key-directory-contract (verification: integration: uv run python -m unittest discover -s tests -v; tests/test_public_skill.py)
+- [ ] 4. Run full suite and real CLI fixture roundtrip, validate strict/archive readiness, archive and leave clean committed changes. verification-id: key-directory-contract (verification: integration: uv run python -m unittest discover -s tests -v; tests/test_envdirx.py)
