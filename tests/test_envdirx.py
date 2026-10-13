@@ -38,13 +38,14 @@ class Fixture:
         self.directory.mkdir()
         self.marker = self.root / "child-ran"
         self.env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "UNSET": "inherited", "HOME": str(self.home)}
+        self.env.pop("XDG_DATA_HOME", None)  # never touch the real default key store
 
-    def call(self, *args, input=None, cwd=None):
-        return subprocess.run([*CLI, *map(str, args)], env=self.env, input=input, capture_output=True, cwd=cwd or self.root, timeout=30)
+    def call(self, *args, input=None, cwd=None, umask=-1):
+        return subprocess.run([*CLI, *map(str, args)], env=self.env, input=input, capture_output=True, cwd=cwd or self.root, timeout=30, umask=umask)
 
-    def on(self, action, *args, input=None, cwd=None, directory=None):
+    def on(self, action, *args, input=None, cwd=None, directory=None, umask=-1):
         """Call ACTION with the envdir selected through the global -d option."""
-        return self.call("-d", directory or self.directory, action, *args, input=input, cwd=cwd)
+        return self.call("-d", directory or self.directory, action, *args, input=input, cwd=cwd, umask=umask)
 
     def snapshot(self):
         """Every path under the fixture root with its bytes or link target."""
@@ -488,7 +489,7 @@ class EnvdirxTest(unittest.TestCase):
     def test_help_describes_grammar(self):
         fx = Fixture(self)
         main_help = fx.call("--help").stdout
-        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen (-k KEYFILE | -K KEYDIR)", b"set [-c] NAME", b"run [--key KEY] -- COMMAND", b"encrypt (NAME [NAME ...] | --all)", b"decrypt [--key KEY] (NAME [NAME ...] | --all)"):
+        for text in (b"./.envs", b"BEFORE the subcommand", b"keygen [-k KEYFILE | -K KEYDIR]", b"set [-c] NAME", b"run [--key KEY] -- COMMAND", b"encrypt (NAME [NAME ...] | --all)", b"decrypt [--key KEY] (NAME [NAME ...] | --all)"):
             self.assertIn(text, main_help)
         self.assertNotIn(b"init", main_help)
         self.assertNotIn(b"encrypt [NAME ...]", main_help)
@@ -509,6 +510,8 @@ class EnvdirxTest(unittest.TestCase):
         keygen_help = fx.call("keygen", "--help").stdout
         self.assertIn(b"sha256", keygen_help)
         self.assertIn(b"no force option", keygen_help)
+        for text in (b"XDG_DATA_HOME", b".local/share/envdirx/keys", b"0700"):
+            self.assertIn(text, keygen_help)
         for action in ("set", "encrypt", "keygen"):
             self.assertNotIn(b"unused", fx.call(action, "--help").stdout)
 
@@ -538,6 +541,10 @@ class EnvdirxTest(unittest.TestCase):
             self.assertIn(text, readme)
             self.assertIn(text, readme_ja)
         self.assertIn("envdirx (-V | --version)", skill)
+        for text in ("keygen [-k KEYFILE \\| -K KEYDIR]", "$XDG_DATA_HOME/envdirx/keys", "$HOME/.local/share/envdirx/keys", "0700"):
+            self.assertIn(text, readme)
+            self.assertIn(text, readme_ja)
+        self.assertNotIn("既定の保存先はない", readme_ja)
         version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
         for text, heading in ((readme, "## Versioning and releases"), (readme_ja, "## バージョンとリリース")):
             section = text.split(heading, 1)[1].split("\n## ", 1)[0]
@@ -1249,7 +1256,7 @@ class KeygenTest(unittest.TestCase):
         fx = Fixture(self)
         (fx.root / "keys").mkdir()
         before = fx.snapshot()
-        for args in ([], ["-k", fx.root / "a.key", "-K", fx.root / "keys"], ["-f", "-k", fx.root / "a.key"], ["-k", fx.root / "a.key", "--force"], ["-k"]):
+        for args in (["-k", fx.root / "a.key", "-K", fx.root / "keys"], ["-f", "-k", fx.root / "a.key"], ["-k", fx.root / "a.key", "--force"], ["-k"], ["-K"], ["--key-dir"]):
             with self.subTest(args=args):
                 result = fx.on("keygen", *args)
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -1336,6 +1343,208 @@ class KeygenTest(unittest.TestCase):
                 self.assertEqual(fx.snapshot(), before)
 
 
+class DefaultKeyDirectoryTest(unittest.TestCase):
+    """keygen without -k/-K: XDG data key store, created lazily at 0700, validated before creation."""
+
+    def keygen(self, fx, xdg=None, umask=-1, directory=None):
+        if xdg is None:
+            fx.env.pop("XDG_DATA_HOME", None)
+        else:
+            fx.env["XDG_DATA_HOME"] = str(xdg)
+        return fx.on("keygen", directory=directory, umask=umask)
+
+    def assert_key(self, fx, store, directory=None):
+        directory = directory or fx.directory
+        public = (directory / ".envdirx.pub").read_bytes()
+        key = store / (hashlib.sha256(public).hexdigest() + ".key")
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(_public_of(key), public)
+        self.assertEqual((directory / ".envdirx.pub").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(os.readlink(directory / ".envdirx.key"), str(key))
+        return key
+
+    def test_location_modes_and_roundtrip(self):
+        for value in (None, "", "relative/data", "~/data", "absolute"):
+            for umask in (0o077, 0o000):
+                with self.subTest(xdg=value, umask=oct(umask)):
+                    fx = Fixture(self)
+                    if value == "absolute":
+                        xdg = fx.root / "xdg"
+                        base, created = xdg, [xdg, xdg / "envdirx", xdg / "envdirx" / "keys"]
+                    else:
+                        xdg, base = value, fx.home / ".local" / "share"
+                        created = [fx.home / ".local", base, base / "envdirx", base / "envdirx" / "keys"]
+                    result = self.keygen(fx, xdg, umask=umask)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, b"")
+                    for path in created:
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+                    self.assert_key(fx, base / "envdirx" / "keys")
+                    self.assertFalse((fx.root / "relative").exists())
+                    self.assertFalse((fx.root / "~").exists(), "literal ~ must not be expanded or created")
+                    self.assertEqual(fx.on("set", "-c", "TOKEN", input=SECRET + b"\n").returncode, 0)
+                    self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
+                    fx.run_ok()
+
+    def test_existing_store_is_preserved_and_pointers_survive_xdg_changes(self):
+        fx = Fixture(self)
+        store = fx.home / ".local" / "share" / "envdirx" / "keys"
+        store.mkdir(parents=True)
+        for path in (store, *store.parents):
+            if fx.home in path.parents:
+                path.chmod(0o755)
+        (store / "existing.key").write_bytes(b"keep")
+        other = fx.root / "other"
+        other.mkdir()
+        self.assertEqual(self.keygen(fx).returncode, 0)
+        self.assertEqual(self.keygen(fx, directory=other).returncode, 0)
+        first, second = self.assert_key(fx, store), self.assert_key(fx, store, other)
+        self.assertNotEqual(first, second)
+        self.assertEqual((store / "existing.key").read_bytes(), b"keep")
+        for path in (store, store.parent, store.parent.parent, fx.home / ".local"):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755, path)
+        fx.on("set", "-c", "TOKEN", input=SECRET + b"\n")
+        fx.env["XDG_DATA_HOME"] = str(fx.root / "moved")
+        fx.run_ok()
+        self.assertEqual(fx.on("get", "TOKEN").stdout, SECRET + b"\n")
+        self.assertFalse((fx.root / "moved").exists())
+
+    def test_explicit_destinations_ignore_default(self):
+        fx = Fixture(self)
+        (fx.root / "blocked").write_bytes(b"")  # an XDG root that would fail if consulted
+        fx.env["XDG_DATA_HOME"] = str(fx.root / "blocked")
+        keys = fx.root / "keys"
+        keys.mkdir()
+        other = fx.root / "other"
+        other.mkdir()
+        _keygen(fx, "-k", fx.root / "svc.key")
+        _keygen(fx, "-K", keys, directory=other)
+        third = fx.root / "third"
+        third.mkdir()
+        before = fx.snapshot()
+        result = fx.on("keygen", "-K", fx.root / "absent", directory=third)
+        self.assertEqual(result.returncode, 111, result.stderr)
+        self.assertEqual(fx.snapshot(), before)
+        self.assertFalse((fx.home / ".local").exists())
+
+    def test_unsafe_defaults_fail_closed_before_creation(self):
+        def alias(fx):
+            (fx.root / "alias").symlink_to(fx.directory)
+            return fx.root / "alias"
+
+        def keys_link(target):
+            def prepare(fx):
+                (fx.root / "xdg" / "envdirx").mkdir(parents=True)
+                (fx.root / "xdg" / "envdirx" / "keys").symlink_to(target(fx))
+                return fx.root / "xdg"
+            return prepare
+
+        def file_at(relative):
+            def prepare(fx):
+                path = fx.root / "xdg" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"keep")
+                return fx.root / "xdg"
+            return prepare
+
+        def cycle(fx):
+            (fx.root / "xdg").mkdir()
+            (fx.root / "xdg" / "envdirx").symlink_to(fx.root / "xdg" / "loop")
+            (fx.root / "xdg" / "loop").symlink_to(fx.root / "xdg" / "envdirx")
+            return fx.root / "xdg"
+
+        cases = {
+            "envdir": lambda fx: fx.directory,
+            "envdir alias": alias,
+            "missing descendant": lambda fx: fx.directory / "sub",
+            "keys links into envdir": keys_link(lambda fx: fx.directory),
+            "dangling keys": keys_link(lambda fx: fx.root / "nowhere"),
+            "keys is file": file_at("envdirx/keys"),
+            "parent is file": file_at("envdirx"),
+            "cyclic link": cycle,
+            "dotdot through missing": lambda fx: fx.root / "missing" / ".." / "x",
+        }
+        for name, prepare in cases.items():
+            with self.subTest(name):
+                fx = Fixture(self)
+                xdg = prepare(fx)
+                before = fx.snapshot()
+                result = self.keygen(fx, xdg)
+                self.assertEqual(result.returncode, 111, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertTrue(result.stderr.startswith(b"envdirx: "), result.stderr)
+                self.assertEqual(fx.snapshot(), before)
+
+    def test_envdir_and_metadata_checks_precede_creation(self):
+        for name in ("missing envdir", ".envdirx.pub", ".envdirx.key"):
+            with self.subTest(name):
+                fx = Fixture(self)
+                if name == "missing envdir":
+                    fx.directory.rmdir()
+                else:
+                    (fx.directory / name).write_bytes(b"keep")
+                before = fx.snapshot()
+                result = self.keygen(fx)
+                self.assertEqual(result.returncode, 111, result.stderr)
+                self.assertEqual(fx.snapshot(), before)
+                self.assertFalse((fx.home / ".local").exists())
+
+    def main(self, fx, environ, patches=()):
+        """Run main() in-process for keygen without destinations; return the exit code."""
+        argv = ["envdirx", "-d", str(fx.directory), "keygen"]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, environ))
+            if "XDG_DATA_HOME" not in environ:
+                os.environ.pop("XDG_DATA_HOME", None)  # restored by patch.dict
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stdout = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for patch in patches:
+                stack.enter_context(patch)
+            with self.assertRaises(SystemExit) as raised:
+                envdirx.main()
+        self.assertEqual(stdout.getvalue(), "")
+        return raised.exception.code
+
+    def test_injected_failures_clean_new_artifacts(self):
+        fx = Fixture(self)
+        (fx.directory / "TOKEN").write_bytes(b"keep")
+        store = fx.root / "xdg" / "envdirx" / "keys"
+        real_create = envdirx._create
+
+        def create(path, data, mode):
+            if path.name == ".envdirx.pub":
+                raise OSError("disk full")
+            real_create(path, data, mode)
+
+        code = self.main(fx, {"XDG_DATA_HOME": str(fx.root / "xdg")}, [mock.patch.object(envdirx, "_create", create)])
+        self.assertEqual(code, 111)
+        self.assertEqual(list(store.iterdir()), [], "new key is removed; the empty store may remain")
+        self.assertEqual(sorted(p.name for p in fx.directory.iterdir()), ["TOKEN"])
+        self.assertEqual((fx.directory / "TOKEN").read_bytes(), b"keep")
+
+    def test_filesystem_and_home_errors_exit_111(self):
+        fx = Fixture(self)
+        before = fx.snapshot()
+        denied = mock.patch.object(envdirx.os, "mkdir", side_effect=PermissionError(13, "Permission denied"))
+        self.assertEqual(self.main(fx, {"XDG_DATA_HOME": str(fx.root / "xdg")}, [denied]), 111)
+        homeless = mock.patch.object(envdirx.Path, "home", side_effect=RuntimeError("Could not determine home directory."))
+        self.assertEqual(self.main(fx, {"HOME": str(fx.home)}, [homeless]), 111)
+        self.assertEqual(fx.snapshot(), before)
+
+    def test_fingerprint_collision_preserves_existing_key(self):
+        fx = Fixture(self)
+        fixed = X25519PrivateKey.generate()
+        public = fixed.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        store = fx.root / "xdg" / "envdirx" / "keys"
+        store.mkdir(parents=True)
+        (store / (hashlib.sha256(public).hexdigest() + ".key")).write_bytes(b"keep")
+        before = fx.snapshot()
+        generate = mock.patch.object(envdirx.X25519PrivateKey, "generate", return_value=fixed)
+        self.assertEqual(self.main(fx, {"XDG_DATA_HOME": str(fx.root / "xdg")}, [generate]), 111)
+        self.assertEqual(fx.snapshot(), before)
+
+
 class KeyMetadataUnitTest(unittest.TestCase):
     """Pure decision logic for key metadata; no filesystem access."""
 
@@ -1355,6 +1564,20 @@ class KeyMetadataUnitTest(unittest.TestCase):
             self.assertEqual(envdirx._home("~/a b"), Path("/h/a b"))
             self.assertEqual(envdirx._home("~user/a"), Path("~user/a"))
             self.assertEqual(envdirx._home("a/~/b"), Path("a/~/b"))
+
+    def test_key_store_selection(self):
+        with mock.patch.object(envdirx.Path, "home", return_value=Path("/h")):
+            fallback = Path("/h/.local/share/envdirx/keys")
+            for environ in ({}, {"XDG_DATA_HOME": ""}, {"XDG_DATA_HOME": "rel"}, {"XDG_DATA_HOME": "~/data"}):
+                self.assertEqual(envdirx._key_store(environ), fallback, environ)
+            self.assertEqual(envdirx._key_store({"XDG_DATA_HOME": "/x"}), Path("/x/envdirx/keys"))
+        with mock.patch.object(envdirx.Path, "home", side_effect=RuntimeError("no home")):
+            with self.assertRaisesRegex(ValueError, "home directory"):
+                envdirx._key_store({})
+            self.assertEqual(envdirx._key_store({"XDG_DATA_HOME": "/x"}), Path("/x/envdirx/keys"))
+        with mock.patch.object(envdirx.Path, "home", return_value=Path("")):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                envdirx._key_store({})
 
 
 if __name__ == "__main__":

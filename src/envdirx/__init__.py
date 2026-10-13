@@ -218,13 +218,64 @@ def _refuse_existing(*paths: Path) -> None:
             raise ValueError(f"already exists; refusing to overwrite: {path}")
 
 
+def _key_store(environ=os.environ) -> Path:
+    """Return the implicit key directory: $XDG_DATA_HOME/envdirx/keys, else ~/.local/share/envdirx/keys.
+
+    Per the XDG spec an empty or relative XDG_DATA_HOME is ignored; a literal ~ is never expanded.
+    """
+    data = environ.get("XDG_DATA_HOME", "")
+    if data and os.path.isabs(data):
+        return Path(data) / "envdirx" / "keys"
+    try:
+        home = Path.home()
+    except RuntimeError as exc:
+        raise ValueError(f"cannot determine home directory for the default key directory: {exc}") from None
+    if not home.is_absolute():
+        raise ValueError(f"home directory must be absolute for the default key directory: {home}")
+    return home / ".local" / "share" / "envdirx" / "keys"
+
+
+def _make_key_store(folder: Path, envdir: Path) -> Path:
+    """Validate FOLDER as outside ENVDIR, then create its missing directories at 0700; return it resolved.
+
+    The deepest existing path is resolved strictly (dangling or cyclic links fail),
+    so symlink aliases of the envdir are rejected before anything is created.
+    Existing directories keep their modes.
+    """
+    missing = []
+    existing = folder
+    while not os.path.lexists(existing):
+        missing.append(existing.name)
+        existing = existing.parent
+    if ".." in missing:
+        raise ValueError(f"invalid default key directory: {folder}")
+    try:
+        resolved = existing.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot resolve default key directory {existing}: {exc.strerror or exc}") from None
+    if not resolved.is_dir():
+        raise ValueError(f"not a directory: {existing}")
+    target = resolved.joinpath(*reversed(missing))
+    if _inside(target, envdir):
+        raise ValueError(f"default key directory must be outside the envdir: {target}")
+    path = resolved
+    for name in reversed(missing):
+        path = path / name
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)  # umask must not loosen or tighten a new key directory
+    return target
+
+
 def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
     """Write an external key (file or fingerprint-named), public key and absolute symlink pointer."""
     envdir = directory.resolve(strict=True)
     pub, pointer = directory / PUB, directory / POINTER
     _refuse_existing(pub, pointer)
     secret, public = _raw(X25519PrivateKey.generate())
-    if key_dir is not None:
+    if key is None and key_dir is None:
+        folder = _make_key_store(_key_store(), envdir)
+        destination = folder / (hashlib.sha256(public).hexdigest() + ".key")
+    elif key_dir is not None:
         folder = _home(key_dir)
         if not folder.is_dir():
             raise ValueError(f"key directory must be an existing directory: {folder}")
@@ -365,7 +416,7 @@ global too: it prints the installed version and reads no envdir.
 
   envdirx (-V | --version)
   envdirx [-d DIR] mkdir
-  envdirx [-d DIR] keygen (-k KEYFILE | -K KEYDIR)
+  envdirx [-d DIR] keygen [-k KEYFILE | -K KEYDIR]
   envdirx [-d DIR] set [-c] NAME          < value
   envdirx [-d DIR ...] get [--key KEY] NAME
   envdirx [-d DIR] encrypt (NAME [NAME ...] | --all)
@@ -437,7 +488,14 @@ Creates a new X25519 key pair: the private key (0600) outside DIRECTORY at
 -k KEYFILE, or in the existing -K KEYDIR named <sha256 of public key>.key;
 DIRECTORY/.envdirx.pub (0644); and DIRECTORY/.envdirx.key, a symlink to the
 key's resolved absolute path. Relative paths use the current directory and a
-leading ~/ expands. Existing files are never overwritten (no force option)."""
+leading ~/ expands. Existing files are never overwritten (no force option).
+
+Without -k or -K the key goes to the default directory
+$XDG_DATA_HOME/envdirx/keys when XDG_DATA_HOME is a non-empty absolute path,
+otherwise $HOME/.local/share/envdirx/keys, named <sha256 of public key>.key.
+Only this default directory is created when missing (mode 0700); existing
+directories keep their modes. Reading never consults it: get, run and
+decrypt use DIRECTORY/.envdirx.key or --key."""
 
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
@@ -452,9 +510,9 @@ def main() -> None:
     encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
     decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
-    destination = keygen.add_mutually_exclusive_group(required=True)
+    destination = keygen.add_mutually_exclusive_group()
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
-    destination.add_argument("-K", "--key-dir", help="existing directory for <sha256>.key")
+    destination.add_argument("-K", "--key-dir", help="existing directory for <sha256>.key (default: created XDG data directory envdirx/keys)")
     set_cmd.add_argument("-c", "--encrypt", action="store_true", help="encrypt with .envdirx.pub instead of storing plaintext")
     set_cmd.add_argument("name")
     get.add_argument("--key", help="private key to use instead of .envdirx.key")
