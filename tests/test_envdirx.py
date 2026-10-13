@@ -133,9 +133,78 @@ class EnvdirxTest(unittest.TestCase):
         (fx.directory / "TOKEN").unlink()
         self.assertEqual((get(fx.root / "missing", second).returncode, get(fx.directory, second, name="ABSENT").returncode), (111, 111))
         self.assertEqual(get(fx.directory, second, name="../TOKEN").returncode, 111)
+        before = fx.snapshot()
         result = fx.call("-d", fx.directory, "-d", second, "set", "TOKEN", input=b"no")
         self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(fx.snapshot(), before)
         self.assertEqual((second / "TOKEN").read_bytes(), b"fallback")
+
+    def test_get_does_not_skip_invalid_entries(self):
+        for label, create, error in (
+            ("dangling symlink", lambda p: p.symlink_to("missing"), b"not a regular file"),
+            ("FIFO", os.mkfifo, b"not a regular file"),
+            ("directory", Path.mkdir, b"not a regular file"),
+            ("malformed ciphertext", lambda p: p.write_bytes(b"encrypted:" + SECRET), b"unsupported ciphertext format"),
+        ):
+            with self.subTest(entry=label):
+                fx = Fixture(self)
+                second = fx.root / "second"
+                second.mkdir()
+                (second / "TOKEN").write_bytes(SECRET)
+                create(fx.directory / "TOKEN")
+                result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+                self.assertEqual((result.returncode, result.stdout), (111, b""))
+                self.assertIn(error, result.stderr)
+                self.assertNotIn(SECRET, result.stderr)
+
+    def test_get_does_not_skip_non_directory(self):
+        fx = Fixture(self)
+        second = fx.root / "second"
+        second.mkdir()
+        (second / "TOKEN").write_bytes(SECRET)
+        fx.directory.rmdir()
+        fx.directory.write_bytes(SECRET)
+        result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+        self.assertIn(b"not a directory", result.stderr)
+        self.assertNotIn(SECRET, result.stderr)
+
+    def test_get_does_not_skip_unreadable_entry(self):
+        fx = Fixture(self)
+        second = fx.root / "second"
+        second.mkdir()
+        (second / "TOKEN").write_bytes(SECRET)
+        entry = fx.directory / "TOKEN"
+        entry.write_bytes(SECRET + b"-primary")
+        entry.chmod(0)
+        try:
+            result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+            self.assertEqual((result.returncode, result.stdout), (111, b""))
+            self.assertIn(b"Permission denied", result.stderr)
+            self.assertNotIn(SECRET, result.stderr)
+        finally:
+            entry.chmod(0o600)
+        result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (0, SECRET + b"-primary"))
+
+    def test_get_does_not_skip_decryption_failure(self):
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        second = fx.root / "second"
+        second.mkdir()
+        wrong_key = fx.root / "wrong.key"
+        self.assertEqual(fx.on("keygen", "-k", wrong_key, directory=second).returncode, 0)
+        (second / "TOKEN").write_bytes(SECRET)
+        before = fx.snapshot()
+        result = fx.call("-d", fx.directory, "-d", second, "get", "--key", wrong_key, "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+        self.assertIn(b"decryption failed", result.stderr)
+        for value in (SECRET, wrong_key.read_bytes(), (fx.root / "service.key").read_bytes()):
+            self.assertNotIn(value, result.stderr)
+        self.assertEqual(fx.snapshot(), before)
+        result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (0, SECRET + b"\n"))
 
     def test_get_does_not_skip_inaccessible_directory(self):
         fx = Fixture(self)
