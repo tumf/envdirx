@@ -87,7 +87,12 @@ test "$(cat app.env/LOG_LEVEL)" = visible
 `get NAME` は平文ならそのバイト列、暗号文なら復号した元のバイト列を標準出力へ書く。`-d` をサブコマンドの前に複数指定すると、その順に探索する。存在しない名前は次へ進み、最初に存在するエントリを使う（空ファイルも優先）。選択した暗号文にはそのディレクトリの `.envdirx.key` を使い、`--key` 指定時はそれを優先する。途中のディレクトリの欠落、見つかったエントリの不正・復号失敗では後続へフォールバックせず 111 で失敗する。複数の `-d` は `get` 以外では使えない（終了コード 2）。
 
 ```sh
-uv run envdirx -d ./local.env -d ./shared.env get API_TOKEN | wc -c
+uv run envdirx -d ./local.env mkdir
+uv run envdirx -d ./shared.env mkdir
+printf 'example-token' | uv run envdirx -d ./shared.env set API_TOKEN
+uv run envdirx -d ./local.env -d ./shared.env get API_TOKEN > /dev/null
+printf 'local-token' | uv run envdirx -d ./local.env set API_TOKEN
+test "$(uv run envdirx -d ./local.env -d ./shared.env get API_TOKEN)" = local-token
 ```
 
 改行を追加せず、`run` のような先頭行・末尾空白・NUL の変換もしない。空のエントリは0バイトを出力して成功する。**これは利用者の要求による明示的な秘密の表示**なので、端末やログに残る場所では使わないこと。エラーメッセージに値が含まれることはない。エントリがない・不正・未対応の `envdirx:` フォーマット・名前が一致しない暗号文・鍵が不正なときは、標準出力に何も書かず 111 で失敗する。`--key` は暗号化エントリにだけ使われ、ポインタより優先される。

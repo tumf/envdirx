@@ -266,15 +266,18 @@ def _get(directory: Path, key: str | None, name: str) -> bytes:
     _regular(path)
     return _value(path, lambda: _private(directory, key))
 
+
 def _get_first(directories: list[Path], key: str | None, name: str) -> bytes:
     _name(name)
     for directory in directories:
         if not directory.is_dir():
             raise ValueError(f"not a directory: {directory}")
         path = directory / name
-        if not os.path.lexists(path):
+        try:
+            _regular(path)
+        except FileNotFoundError:
             continue
-        return _get(directory, key, name)
+        return _value(path, lambda: _private(directory, key))
     raise ValueError(f"missing entry: {name}")
 
 

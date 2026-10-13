@@ -137,18 +137,36 @@ class EnvdirxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual((second / "TOKEN").read_bytes(), b"fallback")
 
+    def test_get_does_not_skip_inaccessible_directory(self):
+        fx = Fixture(self)
+        second = fx.root / "second"
+        second.mkdir()
+        (second / "TOKEN").write_bytes(SECRET)
+        fx.directory.chmod(0)
+        try:
+            result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+            self.assertEqual(result.returncode, 111)
+            self.assertEqual(result.stdout, b"")
+            self.assertNotIn(SECRET, result.stderr)
+        finally:
+            fx.directory.chmod(0o700)
+
     def test_get_uses_selected_directory_pointer(self):
         fx = Fixture(self)
         second = fx.root / "second"
         second.mkdir()
-        self.assertEqual(fx.on("keygen", "-k", fx.root / "key").returncode, 0)
-        (second / ".envdirx.pub").write_bytes((fx.directory / ".envdirx.pub").read_bytes())
-        (second / ".envdirx.key").symlink_to(fx.root / "key")
+        self.assertEqual(fx.on("keygen", "-k", fx.root / "first.key").returncode, 0)
+        self.assertEqual(fx.on("keygen", "-k", fx.root / "second.key", directory=second).returncode, 0)
         self.assertEqual(fx.on("set", "-c", "TOKEN", input=SECRET, directory=second).returncode, 0)
         result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
         self.assertEqual((result.returncode, result.stdout), (0, SECRET))
         (second / ".envdirx.key").unlink()
         result = fx.call("-d", fx.directory, "-d", second, "get", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (111, b""))
+        result = fx.call("-d", fx.directory, "-d", second, "get", "--key", fx.root / "second.key", "TOKEN")
+        self.assertEqual((result.returncode, result.stdout), (0, SECRET))
+        (fx.directory / "TOKEN").write_bytes(b"encrypted:invalid")
+        result = fx.call("-d", fx.directory, "-d", second, "get", "--key", fx.root / "second.key", "TOKEN")
         self.assertEqual((result.returncode, result.stdout), (111, b""))
 
     def test_encrypted_and_plain_envdir_semantics(self):
@@ -428,7 +446,9 @@ class EnvdirxTest(unittest.TestCase):
     def test_readme_commands(self):
         """Run every README ``sh`` block, with ``uv run envdirx`` bound to this checkout."""
         readme = (ROOT / "README.md").read_text()
-        blocks = [b for b in re.findall(r"```sh\n(.*?)```", readme, re.S) if "envdirx" in b and "unittest" not in b]
+        blocks = [b for document in (readme, (ROOT / "README.ja.md").read_text())
+                  for b in re.findall(r"```sh\n(.*?)```", document, re.S)
+                  if "envdirx" in b and "unittest" not in b]
         self.assertGreaterEqual(len(blocks), 5)
         for text in ("envdirx -d DIR set -c NAME", "envdirx -d DIR run [--key K] -- CMD", "`set -c`", "`init` has been removed"):
             self.assertIn(text, readme)
@@ -440,10 +460,10 @@ class EnvdirxTest(unittest.TestCase):
             self.assertIn(text, readme_ja)
         self.assertNotIn("encrypt [NAME ...]`", readme)
         self.assertIsNone(re.search(r"envdirx(?: -d \S+)? encrypt\s*$", readme, re.M), "no implicit-all encrypt")
-        skill = (ROOT / ".agents" / "skills" / "envdirx-operations" / "SKILL.md").read_text()
-        self.assertIn("stores **plaintext** by default", skill)
-        for text in ("encrypt (NAME ... | --all)", "decrypt [--key K] (NAME ... | --all)", "plaintext on disk"):
-            self.assertIn(text, skill)
+        skill = (ROOT / "skills" / "envdirx" / "SKILL.md").read_text()
+        self.assertIn("stores plaintext", skill)
+        self.assertIn("`encrypt` and `decrypt` require names or `--all`", skill)
+        self.assertIn("plaintext on disk", skill)
         self.assertNotIn("encrypt [NAME ...]", skill)
         for text in ("`envdirx --version` / `envdirx -V`", "`uv version <version>`", "`v<version>`", "MAJOR.MINOR.PATCH"):
             self.assertIn(text, readme)

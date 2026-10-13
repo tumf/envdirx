@@ -7,9 +7,10 @@ description: Use when installing, using, testing, or changing the envdirx CLI an
 
 Use the repository's `README.md`, `openspec/specs/`, source, and tests as the authority; do not infer current behavior from older CLI versions. Run `uv run envdirx --help` and the relevant subcommand's `--help` before changing or documenting a command.
 
+- `envdirx (-V | --version)` prints the installed version without reading any envdir.
 - Put `-d DIR` before the subcommand; the default is `./.envs`. Only `mkdir` creates the envdir. There is no `init` command.
 - `set NAME` reads stdin and stores plaintext; `set -c NAME` encrypts with the public key. `encrypt` and `decrypt` require names or `--all`.
-- `run [--key KEY] -- COMMAND` applies DJB envdir semantics and decrypts encrypted entries for the child. `get` emits raw bytes without a newline. Never print real values or private keys in logs or transcripts.
+- `run [--key KEY] -- COMMAND` applies DJB envdir semantics and decrypts encrypted entries for the child. `get` emits raw bytes without a newline. Repeat global `-d` for `get` to search in priority order; only absent entries fall back, and empty entries win. Permission, format, or decryption errors stop the search. Use the selected directory’s key pointer unless `--key` overrides it. Never print real values or private keys in logs or transcripts.
 - Store private keys outside the envdir. `keygen -k FILE` or `keygen -K DIR` creates `.envdirx.pub` and a `.envdirx.key` pointer. `run`, `get`, and `decrypt` use `--key` or that pointer for encrypted entries; never rely on an adjacent-key fallback.
 - `decrypt` writes secrets as plaintext on disk; do not run it on real data without an explicit request for the target entries. Validate key ownership and permissions, preserve fail-closed errors, and do not weaken the `*.key` Git ignore rule.
 - Keep changes minimal, align specifications and tests, and run `uv run python -m unittest discover -s tests -v`. Commit by theme and leave the worktree clean; do not push or publish without instruction.
