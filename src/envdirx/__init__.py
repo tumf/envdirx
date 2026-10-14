@@ -585,34 +585,44 @@ directories keep their modes. Reading never consults it: get, run and
 decrypt use DIRECTORY/.envdirx.key or --key."""
 
 REKEY_HELP = """\
-Rotates to a fresh X25519 key out of place: writes a complete new envdir at
-DEST and a new private key, and never changes or deletes SOURCE (-d, default
-./.envs) or its old key. DEST must not exist (not even as a dangling symlink),
-its parent must already exist, and it must not overlap SOURCE.
+Rotate the encryption key: create a new envdir with encrypted entries
+re-encrypted under a fresh key. The source envdir and old key stay unchanged.
+Plaintext entries stay plaintext.
 
-Unlike keygen, --key OLDKEY names the OLD private key used only to decrypt
-SOURCE (default: SOURCE/.envdirx.key); it is read only when SOURCE holds
-encrypted entries. The NEW private key goes to -k/--new-key NEWKEYFILE, to
-the existing -K/--new-key-dir NEWKEYDIR as <sha256 of public key>.key, or by
-default to the keygen key directory ($XDG_DATA_HOME/envdirx/keys, else
-$HOME/.local/share/envdirx/keys, created mode 0700 when missing). It must lie
-outside SOURCE and DEST and is never overwritten (no force option). Relative
-paths use the current directory and a leading ~/ expands.
+Examples:
+  envdirx rekey --output ./.envs.new
+  envdirx -d ./app.env rekey --output ./app.env.new
 
-Encrypted entries, printable or legacy binary, are decrypted in memory,
-re-encrypted for the new key in the printable format and verified before
-anything is written; decrypted values are never written to disk. Plaintext
-entries are copied unchanged and stay plaintext. Dotfiles other than
-.envdirx.pub/.envdirx.key are refused; those two are replaced, not copied.
-DEST gets a new .envdirx.pub (0644), an absolute .envdirx.key symlink, mode
-0700 and entries 0600. It is staged in a private sibling directory and
-published by one rename; on failure nothing is published and the new key and
-staging directory are removed. An interrupted run may leave a staging
-directory and new key behind, but SOURCE and the old key remain usable.
+Both examples generate a new key automatically; no keygen step is needed.
+Verify the new envdir, then point consumers at it yourself. Nothing is switched
+over automatically, and neither the source nor the old key is deleted.
 
-Nothing is switched over: verify DEST, then point consumers at it yourself.
-The old key still decrypts SOURCE and any copies of it; if a key leaked,
-rotate the underlying service credentials too."""
+Directories and keys:
+  SOURCE: -d DIR before rekey (default: ./.envs).
+  DEST: --output DEST is the new envdir, NOT the new private key file.
+    DEST must not exist, its parent must exist, and it must not overlap SOURCE.
+  OLD key: --key OLDKEY overrides SOURCE/.envdirx.key for decryption.
+    Unlike keygen, --key selects an existing OLD key; it never creates one.
+    The old key is read only when SOURCE contains encrypted entries.
+  NEW key: -k/--new-key NEWKEYFILE sets the private key file to CREATE;
+    -K/--new-key-dir NEWKEYDIR selects an existing directory for <sha256>.key.
+    Omit both to use $XDG_DATA_HOME/envdirx/keys (absolute XDG_DATA_HOME only),
+    else $HOME/.local/share/envdirx/keys, created mode 0700 when missing.
+    The new key must be outside SOURCE and DEST; it is never overwritten.
+    Relative paths use the current directory and a leading ~/ expands.
+
+Safety:
+  Encrypted entries (printable or legacy binary) are decrypted in memory,
+  re-encrypted in printable format and verified before writing; decrypted
+  values are never written to disk. Existing plaintext is copied unchanged.
+  Dotfiles other than .envdirx.pub/.envdirx.key are refused; those two are
+  replaced with a new public key (0644) and absolute private-key symlink.
+  DEST is mode 0700, entries and new private key 0600. A private sibling staging
+  directory is published by one rename. On failure, the new key and staging
+  directory are removed; an interrupted run may leave them behind, but SOURCE
+  and the old key remain usable.
+  The old key still decrypts SOURCE and its copies. If a key leaked,
+  rotate the underlying service credentials too."""
 
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
@@ -626,7 +636,7 @@ def main() -> None:
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
     encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
     decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
-    rekey = sub.add_parser("rekey", help="copy the envdir to a new directory under a fresh key", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
+    rekey = sub.add_parser("rekey", help="rotate the encryption key into a new envdir", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group()
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
