@@ -585,17 +585,15 @@ directories keep their modes. Reading never consults it: get, run and
 decrypt use DIRECTORY/.envdirx.key or --key."""
 
 REKEY_HELP = """\
-Rotate the encryption key: create a new envdir with encrypted entries
-re-encrypted under a fresh key. The source envdir and old key stay unchanged.
-Plaintext entries stay plaintext.
-
 Examples:
   envdirx rekey --output ./.envs.new
   envdirx -d ./app.env rekey --output ./app.env.new
 
-Both examples generate a new key automatically; no keygen step is needed.
-Verify the new envdir, then point consumers at it yourself. Nothing is switched
-over automatically, and neither the source nor the old key is deleted.
+This rotates the encryption key: encrypted entries are re-encrypted in a new
+envdir under a fresh key. Plaintext entries stay plaintext. Both examples
+generate the new key automatically; no keygen step is needed. Verify the new
+envdir, then point consumers at it yourself. Nothing is switched over
+automatically, and neither the source nor the old key is deleted.
 
 Directories and keys:
   SOURCE: -d DIR before rekey (default: ./.envs).
@@ -636,7 +634,7 @@ def main() -> None:
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
     encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
     decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
-    rekey = sub.add_parser("rekey", help="rotate the encryption key into a new envdir", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
+    rekey = sub.add_parser("rekey", help="rotate the encryption key", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group()
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")

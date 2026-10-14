@@ -504,9 +504,11 @@ class EnvdirxTest(unittest.TestCase):
         self.assertNotIn(b"legacy", main_help.lower())
         self.assertIn(b"rekey --output DEST [--key OLDKEY]", main_help)
         self.assertIn(b"[-k NEWKEYFILE | -K NEWKEYDIR]", main_help)
-        self.assertIn(b"rotate the encryption key into a new envdir", main_help)
+        self.assertIn(b"rekey               rotate the encryption key", main_help)
+        self.assertNotIn(b"copy the envdir to a new directory under a fresh key", main_help)
         rekey_help = fx.call("rekey", "--help").stdout
-        for text in (b"Rotate the encryption key", b"envdirx -d ./app.env rekey --output ./app.env.new", b"SOURCE: -d DIR", b"DEST: --output DEST", b"OLD key: --key OLDKEY", b"NEW key: -k/--new-key", b"-k, --new-key NEWKEYFILE", b"-K, --new-key-dir NEWKEYDIR", b"legacy", b"never written to disk", b"stay plaintext", b"one rename", b"rotate the underlying service credentials"):
+        self.assertIn(b"NEWKEYDIR]\n\nExamples:\n", rekey_help)
+        for text in (b"rotates the encryption key", b"envdirx -d ./app.env rekey --output ./app.env.new", b"SOURCE: -d DIR", b"DEST: --output DEST", b"OLD key: --key OLDKEY", b"NEW key: -k/--new-key", b"-k, --new-key NEWKEYFILE", b"-K, --new-key-dir NEWKEYDIR", b"legacy", b"never written to disk", b"stay plaintext", b"one rename", b"rotate the underlying service credentials"):
             self.assertIn(text, rekey_help)
         run_help = fx.call("run", "--help").stdout
         self.assertIn(b"must precede it", run_help)
