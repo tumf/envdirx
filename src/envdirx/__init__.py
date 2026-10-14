@@ -3,6 +3,8 @@
 import argparse
 import base64
 import binascii
+import contextlib
+import ctypes
 import hashlib
 import importlib.metadata
 import os
@@ -398,80 +400,192 @@ def _transform(directory: Path, names: list[str], decrypt: bool, key: str | None
         _atomic(path, data, 0o600)
 
 
-def _output(text: str, envdir: Path) -> Path:
-    """Return the absent rekey destination under its resolved existing parent, not overlapping ENVDIR."""
-    path = _home(text)
-    if os.path.basename(text) in ("", ".", "..") or path.name in ("", ".", ".."):
-        raise ValueError(f"invalid output directory: {text}")
-    _refuse_existing(path)
+EXCHANGE_UNSUPPORTED = "atomic directory exchange is not supported on this platform/libc"
+
+
+def _native_exchange(platform: str, libc):
+    """Bind libc's atomic exchange: Darwin renamex_np(RENAME_SWAP), Linux renameat2(RENAME_EXCHANGE).
+
+    There is deliberately no two-rename fallback: it would leave a window in
+    which the active envdir path does not exist.
+    """
     try:
-        parent = path.parent.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"cannot resolve output parent {path.parent}: {getattr(exc, 'strerror', None) or exc}") from None
-    if not parent.is_dir():
-        raise ValueError(f"not a directory: {path.parent}")
-    output = parent / path.name
-    _refuse_existing(output)
-    if _inside(output, envdir) or _inside(envdir, output):
-        raise ValueError(f"output directory must not overlap the source envdir: {output}")
-    return output
+        if platform == "darwin":
+            function = libc.renamex_np
+            function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+            function.restype = ctypes.c_int
+            return lambda a, b: function(a, b, 2)  # RENAME_SWAP
+        if platform == "linux":
+            function = libc.renameat2
+            function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            function.restype = ctypes.c_int
+            return lambda a, b: function(-100, a, -100, b, 2)  # AT_FDCWD, RENAME_EXCHANGE
+    except AttributeError:
+        pass  # libc without the wrapper
+    raise ValueError(EXCHANGE_UNSUPPORTED)
 
 
-def _rekey(directory: Path, output: str, key: str | None, new_key: str | None, new_key_dir: str | None) -> None:
-    """Write a complete new envdir at OUTPUT under a fresh external key; DIRECTORY and its key stay untouched.
+def _exchange(a: Path, b: Path) -> None:
+    """Atomically swap the directory entries A and B."""
+    call = _native_exchange(sys.platform, ctypes.CDLL(None, use_errno=True))
+    if call(os.fsencode(a), os.fsencode(b)) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(a), None, str(b))
+
+
+def _probe_exchange(parent: Path) -> None:
+    """Swap two private empty sibling directories so an unsupported exchange fails before any key exists."""
+    probes = []
+    try:
+        for _ in range(2):
+            probes.append(Path(tempfile.mkdtemp(prefix=".envdirx-probe-", dir=parent)))
+        _exchange(*probes)
+    except OSError as exc:
+        raise ValueError(f"atomic directory exchange failed in {parent}: {exc.strerror or exc}") from None
+    finally:
+        for probe in probes:
+            with contextlib.suppress(OSError):
+                probe.rmdir()
+
+
+def _rotation_target(directory: Path) -> Path:
+    """Return DIRECTORY's real path once it is safe to replace by a sibling exchange."""
+    envdir = directory.resolve(strict=True)
+    if envdir == Path(envdir.anchor) or os.path.ismount(envdir):
+        raise ValueError(f"refusing to rotate a filesystem root or mountpoint: {envdir}")
+    if _inside(Path.cwd().resolve(), envdir):
+        raise ValueError(f"refusing to rotate the envdir containing the current directory; run from outside it: {envdir}")
+    if not os.access(envdir.parent, os.W_OK | os.X_OK):
+        raise ValueError(f"the envdir's parent must be writable for staging: {envdir.parent}")
+    return envdir
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    st = os.lstat(path)
+    return st.st_dev, st.st_ino
+
+
+def _commit_state(envdir: Path, original: tuple[int, int], staged: tuple[int, int] | None) -> bool | None:
+    """True once ENVDIR is the staged inode, False while it is still ORIGINAL, None when unknown."""
+    try:
+        active = _identity(envdir)
+    except OSError:
+        return None
+    if staged is not None and active == staged:
+        return True
+    return False if active == original else None
+
+
+def _remove_tree(path: Path) -> None:
+    """Remove PATH after making its directories owner-accessible; symlinks are removed, never followed."""
+    os.chmod(path, 0o700)
+    for root, dirs, _ in os.walk(path):
+        for name in dirs:
+            child = os.path.join(root, name)
+            if not os.path.islink(child):
+                os.chmod(child, 0o700)
+    shutil.rmtree(path)
+
+
+def _retire(envdir: Path, old: Path, key: Path) -> None:
+    """After commit: make the exchange durable and remove the previous tree at OLD. Never touches KEY."""
+    problems = []
+    try:
+        fd = os.open(envdir.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        problems.append(f"syncing {envdir.parent} failed ({exc.strerror or exc}), so the rotation may not survive a power loss")
+    try:
+        _remove_tree(old)
+    except OSError as exc:
+        problems.append(f"removing the previous envdir failed ({exc.strerror or exc}); it remains at {old}")
+    if problems:
+        raise ValueError(f"rotation completed: {envdir} now uses the new key {key}; but " + "; ".join(problems))
+
+
+def _rekey(directory: Path, key: str | None, new_key: str | None, new_key_dir: str | None) -> None:
+    """Rotate DIRECTORY in place to a fresh external key; the old key is never modified.
 
     Everything is validated, decrypted, re-encrypted and verified in memory
-    before the first write (a missing default key store may then be created).
-    The new envdir is staged in a private sibling directory and published by a
-    single rename; a handled failure removes the staging directory and the new
-    key. Decrypted values never reach the disk: only ciphertext is staged.
+    before the first write. A complete private sibling staging tree is then
+    swapped with the resolved envdir by one native atomic exchange, the commit
+    point: the path always names a complete envdir. Commit is judged from the
+    active inode, not from control flow. Before commit a failure removes only
+    this run's staging tree and new key; after commit the new key is never
+    removed. Decrypted values never reach the disk: only ciphertext is staged.
     """
-    envdir = directory.resolve(strict=True)
-    destination = _output(output, envdir)
+    envdir = _rotation_target(directory)
+    original = os.lstat(envdir)
     entries = []
-    for path in sorted(directory.iterdir()):
+    for path in sorted(envdir.iterdir()):
         if path.name in (PUB, POINTER):
             continue  # replaced by new metadata, never copied
         if path.name.startswith("."):
             raise ValueError(f"unexpected metadata file: {path}")
         _name(path.name)
         _regular(path)
+        mode = stat.S_IMODE(path.lstat().st_mode)
         data = path.read_bytes()
         if not data.startswith((MAGIC, LEGACY_MAGIC)) and _reserved(data):
             raise ValueError(f"unsupported ciphertext format: {path.name}")
-        entries.append((path.name, data, data.startswith((MAGIC, LEGACY_MAGIC))))
-    if any(encrypted for _, _, encrypted in entries):
-        old = _private(directory, key)  # resolved only when ciphertext exists
-        entries = [(name, _decrypt(data, name, old) if encrypted else data, encrypted) for name, data, encrypted in entries]
+        entries.append((path.name, data, data.startswith((MAGIC, LEGACY_MAGIC)), mode))
+    if any(encrypted for _, _, encrypted, _ in entries):
+        old = _private(envdir, key)  # resolved only when ciphertext exists
+        entries = [(name, _decrypt(data, name, old) if encrypted else data, encrypted, mode) for name, data, encrypted, mode in entries]
     private = X25519PrivateKey.generate()
     secret, public = _raw(private)
     prepared = []
-    for name, data, encrypted in entries:
+    for name, data, encrypted, mode in entries:
         if encrypted:
             ciphertext = _encrypt(data, name, private.public_key())
             if _decrypt(ciphertext, name, private) != data:
                 raise ValueError(f"re-encryption verification failed: {name}")
-            data = ciphertext
-        prepared.append((name, data))  # plaintext entries are copied unchanged
+            data, mode = ciphertext, 0o600
+        prepared.append((name, data, mode))  # plaintext entries keep their bytes and mode
     del entries
-    key_path = _key_destination(new_key, new_key_dir, public, envdir, destination)
-    staging = None
+    _probe_exchange(envdir.parent)
+    key_path = _key_destination(new_key, new_key_dir, public, envdir)
     _create(key_path, secret, 0o600)
+    staging = staged = None
     try:
-        staging = Path(tempfile.mkdtemp(prefix=".envdirx-rekey-", dir=destination.parent))
-        os.chmod(staging, 0o700)  # umask must not loosen or tighten the new envdir
-        _create(staging / PUB, public, 0o644)
-        _link(staging / POINTER, key_path)
-        for name, data in prepared:
-            _create(staging / name, data, 0o600)
-        # rename(2) would replace an empty directory; refuse anything that appeared meanwhile.
-        _refuse_existing(destination)
-        os.rename(staging, destination)
-    except BaseException:
+        staging = Path(tempfile.mkdtemp(prefix=".envdirx-rekey-", dir=envdir.parent))
+        os.chmod(staging, 0o700)  # writable and readable by us until fully written
+        fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _create(staging / PUB, public, 0o644)
+            _link(staging / POINTER, key_path)
+            for name, data, mode in prepared:
+                _create(staging / name, data, mode)
+            os.fchmod(fd, stat.S_IMODE(original.st_mode))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        staged = _identity(staging)
+        _exchange(envdir, staging)  # commit point
+    except BaseException as exc:
+        reason = "interrupted" if isinstance(exc, KeyboardInterrupt) else str(exc)
+        state = _commit_state(envdir, (original.st_dev, original.st_ino), staged)
+        if state is None:
+            raise ValueError(f"rotation state is unknown ({reason}); kept the new key {key_path} and staging {staging}: "
+                             f"check which key {envdir / POINTER} references before removing anything") from None
+        if state:
+            raise ValueError(f"rotation completed: {envdir} now uses the new key {key_path}; but it was {reason} "
+                             f"before cleanup; the previous envdir remains at {staging}") from None
         if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                _remove_tree(staging)
         key_path.unlink(missing_ok=True)  # _create's O_EXCL guarantees this invocation created it
+        if isinstance(exc, KeyboardInterrupt):
+            raise ValueError(f"interrupted before publication; {envdir} and the old key are unchanged") from None
         raise
+    try:
+        _retire(envdir, staging, key_path)
+    except KeyboardInterrupt:
+        raise ValueError(f"rotation completed: {envdir} now uses the new key {key_path}; but cleanup was interrupted; "
+                         f"the previous envdir may remain at {staging}") from None
 
 
 def _run(directory: Path, key: str | None, command: list[str]) -> None:
@@ -506,8 +620,7 @@ global too: it prints the installed version and reads no envdir.
   envdirx [-d DIR ...] get [--key KEY] NAME
   envdirx [-d DIR] encrypt (NAME [NAME ...] | --all)
   envdirx [-d DIR] decrypt [--key KEY] (NAME [NAME ...] | --all)
-  envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY]
-                            [-k NEWKEYFILE | -K NEWKEYDIR]
+  envdirx [-d DIR] rekey [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]
   envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]"""
 
 KEY_HELP = """\
@@ -586,41 +699,45 @@ decrypt use DIRECTORY/.envdirx.key or --key."""
 
 REKEY_HELP = """\
 Examples:
-  envdirx rekey --output ./.envs.new
-  envdirx -d ./app.env rekey --output ./app.env.new
+  envdirx rekey
+  envdirx -d ./app.env rekey -k ~/keys/app.env.key
 
-This rotates the encryption key: encrypted entries are re-encrypted in a new
-envdir under a fresh key. Plaintext entries stay plaintext. Both examples
-generate the new key automatically; no keygen step is needed. Verify the new
-envdir, then point consumers at it yourself. Nothing is switched over
-automatically, and neither the source nor the old key is deleted.
+This rotates the encryption key of DIR in place: encrypted entries are
+re-encrypted under a fresh key and DIR keeps its path, so consumers need no
+switch-over. Plaintext entries stay plaintext. The new key is generated
+automatically; no keygen step is needed. The old key is never deleted.
 
 Directories and keys:
-  SOURCE: -d DIR before rekey (default: ./.envs).
-  DEST: --output DEST is the new envdir, NOT the new private key file.
-    DEST must not exist, its parent must exist, and it must not overlap SOURCE.
-  OLD key: --key OLDKEY overrides SOURCE/.envdirx.key for decryption.
+  DIR: -d DIR before rekey (default: ./.envs); symlink aliases stay intact.
+    DIR must not be a filesystem root or mountpoint, must not contain the
+    current directory, and its parent must be writable.
+  OLD key: --key OLDKEY overrides DIR/.envdirx.key for decryption.
     Unlike keygen, --key selects an existing OLD key; it never creates one.
-    The old key is read only when SOURCE contains encrypted entries.
+    The old key is read only when DIR contains encrypted entries.
   NEW key: -k/--new-key NEWKEYFILE sets the private key file to CREATE;
     -K/--new-key-dir NEWKEYDIR selects an existing directory for <sha256>.key.
     Omit both to use $XDG_DATA_HOME/envdirx/keys (absolute XDG_DATA_HOME only),
     else $HOME/.local/share/envdirx/keys, created mode 0700 when missing.
-    The new key must be outside SOURCE and DEST; it is never overwritten.
+    The new key must be outside DIR; it is never overwritten.
     Relative paths use the current directory and a leading ~/ expands.
 
 Safety:
   Encrypted entries (printable or legacy binary) are decrypted in memory,
   re-encrypted in printable format and verified before writing; decrypted
-  values are never written to disk. Existing plaintext is copied unchanged.
-  Dotfiles other than .envdirx.pub/.envdirx.key are refused; those two are
-  replaced with a new public key (0644) and absolute private-key symlink.
-  DEST is mode 0700, entries and new private key 0600. A private sibling staging
-  directory is published by one rename. On failure, the new key and staging
-  directory are removed; an interrupted run may leave them behind, but SOURCE
-  and the old key remain usable.
-  The old key still decrypts SOURCE and its copies. If a key leaked,
-  rotate the underlying service credentials too."""
+  values are never written to disk. Existing plaintext is copied unchanged
+  with its mode. Dotfiles other than .envdirx.pub/.envdirx.key are refused;
+  those two are replaced with a new public key (0644) and absolute
+  private-key symlink. DIR keeps its mode; re-encrypted entries and the new
+  private key are 0600. A complete sibling staging directory replaces DIR by
+  one atomic directory exchange (renamex_np on macOS, renameat2 on Linux);
+  without it rekey fails and changes nothing. On failure before the exchange,
+  DIR and the old key are unchanged and the new key is removed; after it, the
+  new key is kept even if cleanup fails. A killed run may leave a
+  .envdirx-rekey-* directory or a new key behind: check which key
+  DIR/.envdirx.key points to before deleting anything. Processes reading DIR
+  during the exchange may fail; stop writers first. The old key still decrypts
+  old copies of DIR. If a key leaked, rotate the underlying service
+  credentials too."""
 
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
@@ -634,7 +751,7 @@ def main() -> None:
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
     encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
     decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
-    rekey = sub.add_parser("rekey", help="rotate the encryption key", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
+    rekey = sub.add_parser("rekey", help="rotate the encryption key", usage="%(prog)s [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group()
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
@@ -647,10 +764,10 @@ def main() -> None:
         transform.add_argument("--all", action="store_true", help=f"{verb} every visible entry that needs it")
         transform.add_argument("names", nargs="*", metavar="NAME", help=f"entry to {verb}")
     decrypt.add_argument("--key", help="private key to use instead of .envdirx.key")
-    rekey.add_argument("--output", required=True, metavar="DEST", help="new envdir to create; must not exist")
-    rekey.add_argument("--key", metavar="OLDKEY", help="OLD private key for decrypting SOURCE instead of SOURCE/.envdirx.key")
+    rekey.add_argument("--output", nargs="?", const="", help=argparse.SUPPRESS)  # removed; detected for a clear error
+    rekey.add_argument("--key", metavar="OLDKEY", help="OLD private key for decrypting DIR instead of DIR/.envdirx.key")
     new_key = rekey.add_mutually_exclusive_group()
-    new_key.add_argument("-k", "--new-key", metavar="NEWKEYFILE", help="NEW private key file to create outside SOURCE and DEST")
+    new_key.add_argument("-k", "--new-key", metavar="NEWKEYFILE", help="NEW private key file to create outside DIR")
     new_key.add_argument("-K", "--new-key-dir", metavar="NEWKEYDIR", help="existing directory for the NEW <sha256>.key (default: created XDG data directory envdirx/keys)")
     run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
@@ -659,6 +776,8 @@ def main() -> None:
     directory = directories[0]
     if args.action != "get" and len(directories) > 1:
         parser.error("multiple -d directories are supported only for get")
+    if args.action == "rekey" and args.output is not None:
+        parser.error("--output was removed: rekey now rotates the key in place at DIR (use -d DIR)")
     if args.action == "run" and (args.command[:1] != ["--"] or len(args.command) < 2):
         run.error("expected -- COMMAND [ARGS...]")
     if args.action in ("encrypt", "decrypt"):
@@ -683,7 +802,7 @@ def main() -> None:
         elif args.action in ("encrypt", "decrypt"):
             _transform(directory, args.names, args.action == "decrypt", getattr(args, "key", None))
         elif args.action == "rekey":
-            _rekey(directory, args.output, args.key, args.new_key, args.new_key_dir)
+            _rekey(directory, args.key, args.new_key, args.new_key_dir)
         elif args.action == "set":
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
         else:

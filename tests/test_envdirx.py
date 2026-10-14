@@ -1,16 +1,20 @@
 import base64
 import contextlib
+import ctypes
+import errno
 import importlib.metadata
 import hashlib
 import io
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -502,14 +506,16 @@ class EnvdirxTest(unittest.TestCase):
         for text in (b"[--key KEY] (NAME [NAME ...] | --all)", b"plaintext", b'"envdirx:"', b"not a transaction", b".envdirx.key"):
             self.assertIn(text, decrypt_help)
         self.assertNotIn(b"legacy", main_help.lower())
-        self.assertIn(b"rekey --output DEST [--key OLDKEY]", main_help)
-        self.assertIn(b"[-k NEWKEYFILE | -K NEWKEYDIR]", main_help)
+        self.assertIn(b"envdirx [-d DIR] rekey [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", main_help)
+        self.assertNotIn(b"--output", main_help)
         self.assertIn(b"rekey               rotate the encryption key", main_help)
         self.assertNotIn(b"copy the envdir to a new directory under a fresh key", main_help)
         rekey_help = fx.call("rekey", "--help").stdout
-        self.assertIn(b"NEWKEYDIR]\n\nExamples:\n", rekey_help)
-        for text in (b"rotates the encryption key", b"envdirx -d ./app.env rekey --output ./app.env.new", b"SOURCE: -d DIR", b"DEST: --output DEST", b"OLD key: --key OLDKEY", b"NEW key: -k/--new-key", b"-k, --new-key NEWKEYFILE", b"-K, --new-key-dir NEWKEYDIR", b"legacy", b"never written to disk", b"stay plaintext", b"one rename", b"rotate the underlying service credentials"):
+        self.assertIn(b"usage: envdirx rekey [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]\n\nExamples:\n  envdirx rekey\n", rekey_help)
+        for text in (b"rotates the encryption key of DIR in place", b"envdirx -d ./app.env rekey -k", b"DIR: -d DIR", b"symlink aliases stay intact", b"mountpoint", b"OLD key: --key OLDKEY", b"NEW key: -k/--new-key", b"-k, --new-key NEWKEYFILE", b"-K, --new-key-dir NEWKEYDIR", b"legacy", b"never written to disk", b"stay plaintext", b"atomic directory exchange", b"renamex_np", b"renameat2", b"DIR/.envdirx.key points to", b"rotate the underlying service\n  credentials"):
             self.assertIn(text, rekey_help)
+        for text in (b"--output", b"DEST", b"SOURCE", b"one rename", b"point consumers"):
+            self.assertNotIn(text, rekey_help)
         run_help = fx.call("run", "--help").stdout
         self.assertIn(b"must precede it", run_help)
         self.assertIn(b".envdirx.key", run_help)
@@ -558,11 +564,13 @@ class EnvdirxTest(unittest.TestCase):
         self.assertNotIn("rotation command", readme)
         self.assertNotIn("鍵ローテーションはない", readme_ja)
         for document in (readme, readme_ja):
-            for text in ("rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \\| -K NEWKEYDIR]", "[-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]", "keygen --key", "rekey --output app.env.new", "mv app.env.new app.env", ".envdirx-rekey-*"):
+            for text in ("envdirx [-d D] rekey [--key OLDKEY] [-k NEWKEYFILE \\| -K NEWKEYDIR]", "envdirx [-d DIR] rekey [--key OLDKEY] [-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]", "keygen --key", "envdirx -d app.env rekey -k", "`rekey --output DEST`", ".envdirx-rekey-*", "readlink DIR/.envdirx.key", "`renamex_np`", "`renameat2`", "`RENAME_EXCHANGE`", "`rotation completed`"):
                 self.assertIn(text, document)
-        for text in ("names the old key", "stay plaintext", "never written to disk", "rotate the underlying service credentials", "remain usable"):
+            for text in ("rekey --output app.env.new", "mv app.env.new app.env", "[-d SOURCE]", "rekey --output DEST [--key"):
+                self.assertNotIn(text, document)
+        for text in ("rotates the encryption key in place", "nothing to switch over", "names the old key", "stay plaintext", "never written to disk", "rotate the underlying service credentials", "never missing or half-replaced", "power loss", "Readers running during the exchange may fail", "keeps seeing the previous envdir", "There is no non-atomic fallback"):
             self.assertIn(text, readme)
-        for text in ("旧鍵を指す", "平文のまま残る", "ディスクに書いたり表示したりすることはない", "認証情報も更新する", "そのまま使える"):
+        for text in ("その場でローテーション", "切り替え作業はない", "旧鍵を指す", "平文のまま残る", "ディスクに書いたり表示したりすることはない", "認証情報も更新する", "消えたり一部だけ置き換わったりすることはない", "電源断", "交換の最中に読み込んでいるプロセスは失敗することがある", "以前の envdir を見続ける", "原子的でない代替手段はない"):
             self.assertIn(text, readme_ja)
         self.assertIn("Its `--key` is the OLD key", skill)
         self.assertNotIn("ciphertext only", readme)
@@ -1585,11 +1593,30 @@ class DefaultKeyDirectoryTest(unittest.TestCase):
         self.assertEqual(fx.snapshot(), before)
 
 
-class RekeyTest(unittest.TestCase):
-    """rekey: out-of-place rotation to a fresh key, fail-closed, never writing decrypted values."""
+BARRIER = """
+import os, signal, sys
+from pathlib import Path
+import envdirx
+real, target, when = envdirx._exchange, Path(sys.argv[1]), sys.argv[2]
 
-    def mixed(self, fx):
-        """Source with printable/legacy ciphertext, binary/empty/reserved values, plaintext and a random sentinel."""
+def exchange(a, b):
+    if Path(a) == target and when == "before":
+        os.kill(os.getpid(), signal.SIGKILL)
+    real(a, b)
+    if Path(a) == target and when == "after":
+        os.kill(os.getpid(), signal.SIGKILL)
+
+envdirx._exchange = exchange
+sys.argv = ["envdirx", *sys.argv[3:]]
+envdirx.main()
+"""
+
+
+class RekeyTest(unittest.TestCase):
+    """rekey: in-place rotation to a fresh key by one atomic exchange, fail-closed, never writing decrypted values."""
+
+    def mixed(self, fx, dir_mode=0o700, plain_mode=0o644):
+        """Envdir with printable/legacy ciphertext, binary/empty/reserved values, plaintext and a random sentinel."""
         fx.keygen_encrypted()
         self.sentinel = os.urandom(16).hex().encode()
         public = envdirx.X25519PublicKey.from_public_bytes((fx.directory / ".envdirx.pub").read_bytes())
@@ -1604,13 +1631,21 @@ class RekeyTest(unittest.TestCase):
         plain = {"PLAIN": b"plain-value\n", "EMPTY": b""}
         for name, value in plain.items():
             (fx.directory / name).write_bytes(value)
-            (fx.directory / name).chmod(0o644)
+            (fx.directory / name).chmod(plain_mode)
+        fx.directory.chmod(dir_mode)
         self.encrypted, self.plain = encrypted, plain
         self.old_key = fx.root / "service.key"
+        self.old_key_bytes = self.old_key.read_bytes()
+        self.old_ciphertext = {name: (fx.directory / name).read_bytes() for name in encrypted}
+        self.dir_mode, self.plain_mode = dir_mode, plain_mode
 
-    def source_state(self, fx):
-        """Bytes/link targets of every path outside the fixture's new outputs (source, old key, home)."""
-        return {p: v for p, v in fx.snapshot().items() if not p.relative_to(fx.root).parts[0].startswith(("new", ".envdirx-rekey-", "xdg"))}
+    def residue(self, fx):
+        return sorted(p for p in fx.root.iterdir() if p.name.startswith(".envdirx-"))
+
+    def outside(self, fx):
+        """Bytes/link targets of every path outside the envdir and the new-key locations (old key, HOME, ...)."""
+        skip = (fx.directory, fx.root / "new.key", fx.root / "xdg")
+        return {p: v for p, v in fx.snapshot().items() if not any(envdirx._inside(p, s) for s in skip) and not p.name.startswith(".envdirx-")}
 
     def assert_clean(self, fx, result, *outputs):
         """No sentinel/secret/key bytes in any file under the fixture (incl. isolated HOME) or OUTPUTS."""
@@ -1624,12 +1659,12 @@ class RekeyTest(unittest.TestCase):
             for secret in secrets + keys:
                 self.assertNotIn(secret, output)
 
-    def rekey(self, fx, *args, umask=-1, directory=None):
-        return fx.on("rekey", *args, directory=directory, umask=umask)
+    def rekey(self, fx, *args, umask=-1, directory=None, cwd=None):
+        return fx.call("-d", directory or fx.directory, "rekey", *args, umask=umask, cwd=cwd)
 
-    def fails(self, fx, *args, directory=None, code=111):
+    def fails(self, fx, *args, directory=None, code=111, cwd=None):
         before = fx.snapshot()
-        result = self.rekey(fx, *args, directory=directory)
+        result = self.rekey(fx, *args, directory=directory, cwd=cwd)
         self.assertEqual(result.returncode, code, result.stderr)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(fx.snapshot(), before, "nothing is written")
@@ -1638,64 +1673,72 @@ class RekeyTest(unittest.TestCase):
         self.assert_clean(fx, result)
         return result
 
-    def assert_rotated(self, fx, new, key):
-        self.assertEqual(new.stat().st_mode & 0o777, 0o700)
+    def assert_rotated(self, fx, key):
+        """FX.directory, at its unchanged path, holds every value under KEY; the old key is untouched and useless."""
+        envdir = fx.directory
+        self.assertEqual(envdir.stat().st_mode & 0o777, self.dir_mode)
         self.assertEqual(key.stat().st_mode & 0o777, 0o600)
-        public = new / ".envdirx.pub"
+        public = envdir / ".envdirx.pub"
         self.assertEqual(public.stat().st_mode & 0o777, 0o644)
         self.assertEqual(_public_of(key), public.read_bytes())
-        self.assertEqual(os.readlink(new / ".envdirx.key"), str(key))
-        self.assertTrue(os.path.isabs(os.readlink(new / ".envdirx.key")))
+        self.assertEqual(os.readlink(envdir / ".envdirx.key"), str(key))
+        self.assertTrue(os.path.isabs(os.readlink(envdir / ".envdirx.key")))
+        self.assertEqual(self.old_key.read_bytes(), self.old_key_bytes, "old key unchanged")
+        self.assertNotEqual(key.read_bytes(), self.old_key_bytes)
         names = {**self.encrypted, **self.plain}
-        self.assertEqual(sorted(p.name for p in new.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *names]))
+        self.assertEqual(sorted(p.name for p in envdir.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *names]))
         for name, value in self.plain.items():
-            self.assertEqual((new / name).read_bytes(), value)
-            self.assertEqual((new / name).stat().st_mode & 0o777, 0o600, name)
-            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o644, name)
+            self.assertEqual((envdir / name).read_bytes(), value)
+            self.assertEqual((envdir / name).stat().st_mode & 0o777, self.plain_mode, name)
         for name, value in self.encrypted.items():
-            stored = (new / name).read_bytes()
+            stored = (envdir / name).read_bytes()
             self.assertTrue(stored.startswith(envdirx.MAGIC) and stored.endswith(b"\n"), name)
             self.assertEqual(stored.count(b"\n"), 1)
-            self.assertNotEqual(stored, (fx.directory / name).read_bytes())
-            self.assertEqual((new / name).stat().st_mode & 0o777, 0o600)
-            result = fx.call("-d", new, "get", name)
+            self.assertNotEqual(stored, self.old_ciphertext[name])
+            self.assertEqual((envdir / name).stat().st_mode & 0o777, 0o600)
+            result = fx.on("get", name)
             self.assertEqual((result.returncode, result.stdout), (0, value), result.stderr)
             # The old key cannot read the new ciphertext.
-            self.assertEqual(fx.call("-d", new, "get", "--key", self.old_key, name).returncode, 111)
+            self.assertEqual(fx.on("get", "--key", self.old_key, name).returncode, 111)
+        self.assertEqual(self.residue(fx), [], "no staging or probe directory remains")
 
-    def test_lossless_rotation_preserves_source(self):
-        for umask in (0o000, 0o022, 0o077):
-            with self.subTest(umask=oct(umask)):
-                fx = Fixture(self)
-                self.mixed(fx)
-                before = self.source_state(fx)
-                new, key = fx.root / "new", fx.root / "new.key"
-                result = self.rekey(fx, "--output", new, "-k", key, umask=umask)
-                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
-                self.assertEqual(self.source_state(fx), before, "source and old key unchanged")
-                self.assertNotEqual(key.read_bytes(), self.old_key.read_bytes())
-                self.assert_rotated(fx, new, key)
-                child = fx.call("-d", new, "run", "--", *SHOW)
-                self.assertEqual(child.returncode, 0, child.stderr)
-                self.assertEqual(json.loads(child.stdout)["PLAIN"], "plain-value")
-                self.assertEqual(json.loads(child.stdout)["TOKEN"], "top-secret-value")
-                fx.run_ok()
-                self.assertEqual(fx.on("get", "SENTINEL").stdout, self.sentinel)
-                self.assertEqual([p.name for p in fx.root.iterdir() if p.name.startswith(".envdirx-")], [])
-                self.assert_clean(fx, result)
+    def test_same_path_rotation_preserves_values_and_modes(self):
+        for dir_mode, plain_mode in ((0o700, 0o644), (0o500, 0o444), (0o755, 0o600)):
+            for umask in (0o000, 0o022, 0o077):
+                with self.subTest(dir_mode=oct(dir_mode), plain_mode=oct(plain_mode), umask=oct(umask)):
+                    fx = Fixture(self)
+                    self.mixed(fx, dir_mode, plain_mode)
+                    before = self.outside(fx)
+                    key = fx.root / "new.key"
+                    result = self.rekey(fx, "-k", key, umask=umask)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+                    self.assertEqual(self.outside(fx), before, "old key and everything else unchanged")
+                    self.assert_rotated(fx, key)
+                    self.assertEqual(sorted(p.name for p in fx.root.iterdir()), ["home", "new.key", "service", "service.key"], "no second envdir")
+                    child = fx.on("run", "--", *SHOW)
+                    self.assertEqual(child.returncode, 0, child.stderr)
+                    self.assertEqual(json.loads(child.stdout)["PLAIN"], "plain-value")
+                    self.assertEqual(json.loads(child.stdout)["TOKEN"], "top-secret-value")
+                    self.assertEqual(fx.on("get", "SENTINEL").stdout, self.sentinel)
+                    self.assert_clean(fx, result)
 
-    def test_relative_and_tilde_paths(self):
+    def test_symlink_alias_relative_and_tilde_paths(self):
         fx = Fixture(self)
         self.mixed(fx)
+        (fx.root / "alias").symlink_to("service")
         (fx.home / "keys").mkdir()
-        result = fx.call("-d", "service", "rekey", "--output", "~/new", "-K", "~/keys")
+        result = fx.call("-d", "alias", "rekey", "-K", "~/keys")
         self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
-        public = (fx.home / "new" / ".envdirx.pub").read_bytes()
-        self.assert_rotated(fx, fx.home / "new", fx.home / "keys" / (hashlib.sha256(public).hexdigest() + ".key"))
-        os.symlink(fx.root, fx.root / "alias")
-        result = fx.call("-d", "service", "rekey", "--output", "alias/new2", "-k", "alias/new2.key")
+        self.assertEqual(os.readlink(fx.root / "alias"), "service", "the caller's alias stays a symlink")
+        key = fx.home / "keys" / (hashlib.sha256((fx.directory / ".envdirx.pub").read_bytes()).hexdigest() + ".key")
+        self.assert_rotated(fx, key)
+        self.assertEqual(fx.call("-d", "alias", "get", "SENTINEL").stdout, self.sentinel)
+        os.symlink(fx.root, fx.root / "rootalias")
+        self.old_key, self.old_key_bytes = key, key.read_bytes()
+        self.old_ciphertext = {name: (fx.directory / name).read_bytes() for name in self.encrypted}
+        result = fx.call("-d", "service", "rekey", "-k", "rootalias/new2.key")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(os.readlink(fx.root / "new2" / ".envdirx.key"), str(fx.root / "new2.key"))
+        self.assert_rotated(fx, fx.root / "new2.key")
 
     def test_old_key_selection_and_missing_metadata(self):
         fx = Fixture(self)
@@ -1703,14 +1746,18 @@ class RekeyTest(unittest.TestCase):
         moved = fx.move_key(fx.root / "elsewhere" / "old.key")
         self.old_key = moved
         (fx.directory / ".envdirx.pub").unlink()
-        self.fails(fx, "--output", fx.root / "new", "-k", fx.root / "new.key")
-        result = self.rekey(fx, "--output", fx.root / "new", "--key", moved, "-k", fx.root / "new.key")
+        self.fails(fx, "-k", fx.root / "new.key")
+        result = self.rekey(fx, "--key", moved, "-k", fx.root / "new.key")
         self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
-        self.assert_rotated(fx, fx.root / "new", fx.root / "new.key")
-        # The source pointer is matched by name only: a directory there is ignored when --key is given.
-        (fx.directory / ".envdirx.key").mkdir()
-        result = self.rekey(fx, "--output", fx.root / "new3", "--key", moved, "-k", fx.root / "new3.key")
+        self.assert_rotated(fx, fx.root / "new.key")
+        # The pointer is matched by name only: a directory there is ignored with --key and removed with the old tree.
+        (fx.directory / ".envdirx.key").unlink()
+        (fx.directory / ".envdirx.key").mkdir(mode=0o500)
+        self.old_ciphertext = {name: (fx.directory / name).read_bytes() for name in self.encrypted}
+        result = self.rekey(fx, "--key", fx.root / "new.key", "-k", fx.root / "new3.key")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.old_key, self.old_key_bytes = fx.root / "new.key", (fx.root / "new.key").read_bytes()
+        self.assert_rotated(fx, fx.root / "new3.key")
 
     def test_plaintext_only_and_empty_need_no_old_key(self):
         for contents in ({}, {"PLAIN": b"p\n", "EMPTY": b""}):
@@ -1720,17 +1767,15 @@ class RekeyTest(unittest.TestCase):
                     (fx.directory / name).write_bytes(value)
                     (fx.directory / name).chmod(0o644)
                 (fx.directory / ".envdirx.key").symlink_to("missing")  # never read without ciphertext
-                before = fx.snapshot()
-                result = self.rekey(fx, "--output", fx.root / "new", "--key", fx.root / "missing.key", "-k", fx.root / "new.key")
+                result = self.rekey(fx, "--key", fx.root / "missing.key", "-k", fx.root / "new.key")
                 self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
-                new = fx.root / "new"
-                self.assertEqual(sorted(p.name for p in new.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *contents]))
+                self.assertEqual(sorted(p.name for p in fx.directory.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *contents]))
                 for name, value in contents.items():
-                    self.assertEqual((new / name).read_bytes(), value)
-                    self.assertEqual((new / name).stat().st_mode & 0o777, 0o600, name)
+                    self.assertEqual((fx.directory / name).read_bytes(), value)
                     self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o644, name)
-                self.assertEqual(_public_of(fx.root / "new.key"), (new / ".envdirx.pub").read_bytes())
-                self.assertEqual({p: v for p, v in fx.snapshot().items() if p.name not in ("new.key",) and new not in (p, *p.parents)}, before)
+                self.assertEqual(_public_of(fx.root / "new.key"), (fx.directory / ".envdirx.pub").read_bytes())
+                self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(fx.root / "new.key"))
+                self.assertEqual(self.residue(fx), [])
 
     def test_default_and_explicit_key_stores(self):
         for label in ("home", "xdg", "keydir", "keyfile"):
@@ -1751,21 +1796,19 @@ class RekeyTest(unittest.TestCase):
                         args = ["-K", store]
                     else:
                         args = ["--new-key", fx.root / "file.key"]
-                    new = fx.root / "new"
-                    result = self.rekey(fx, "--output", new, *args, umask=umask)
+                    result = self.rekey(fx, *args, umask=umask)
                     self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
                     if label == "keyfile":
                         key = fx.root / "file.key"
                     else:
-                        key = store / (hashlib.sha256((new / ".envdirx.pub").read_bytes()).hexdigest() + ".key")
+                        key = store / (hashlib.sha256((fx.directory / ".envdirx.pub").read_bytes()).hexdigest() + ".key")
                         expected = 0o755 if label == "keydir" else 0o700
                         self.assertEqual(store.stat().st_mode & 0o777, expected)
-                    self.assert_rotated(fx, new, key)
+                    self.assert_rotated(fx, key)
                     if label != "home":
                         self.assertFalse((fx.home / ".local").exists())
-                    # No overwrite: the same destination is refused for a second rotation.
-                    if label == "keyfile":
-                        self.fails(fx, "--output", fx.root / "new2", *args)
+                    if label == "keyfile":  # no overwrite: the same key file is refused for a second rotation
+                        self.fails(fx, *args)
 
     def test_validation_refusals_write_nothing(self):
         def wrong_name(fx):
@@ -1775,8 +1818,13 @@ class RekeyTest(unittest.TestCase):
             other = fx.root / "other.key"
             other.write_bytes(envdirx._raw(X25519PrivateKey.generate())[0])
             other.chmod(0o600)
-            return ["--key", other]
+            return ["--key", other, "-k", fx.root / "new.key"]
 
+        def readonly_parent(fx):
+            fx.root.chmod(0o555)
+            self.addCleanup(fx.root.chmod, 0o755)
+
+        new_key = lambda fx: fx.root / "new.key"
         cases = {
             "malformed": lambda fx: (fx.directory / "BAD").write_bytes(b"encrypted:B!!!\n"),
             "truncated legacy": lambda fx: (fx.directory / "BAD").write_bytes(envdirx.LEGACY_MAGIC + b"short"),
@@ -1788,60 +1836,70 @@ class RekeyTest(unittest.TestCase):
             "directory entry": lambda fx: (fx.directory / "SUB").mkdir(),
             "invalid name": lambda fx: (fx.directory / "A=B").write_bytes(b"x"),
             "unexpected dotfile": lambda fx: (fx.directory / ".env").write_bytes(b"x"),
-            "existing destination": lambda fx: (fx.root / "new").mkdir(),
-            "dangling destination": lambda fx: (fx.root / "new").symlink_to("nowhere"),
             "existing key file": lambda fx: (fx.root / "new.key").write_bytes(b"keep"),
-            "default store after bad entry": lambda fx: ((fx.directory / "BAD").write_bytes(b"encrypted:B!!!\n"), ["--output", fx.root / "new"])[1],
-            "output inside source": lambda fx: ["--output", fx.directory / "new", "-k", fx.root / "new.key"],
-            "output inside source alias": lambda fx: ((fx.root / "alias").symlink_to(fx.directory), ["--output", fx.root / "alias" / "new", "-k", fx.root / "new.key"])[1],
-            "output parent missing": lambda fx: ["--output", fx.root / "absent" / "new", "-k", fx.root / "new.key"],
-            "output parent dangling": lambda fx: ((fx.root / "dangle").symlink_to("nowhere"), ["--output", fx.root / "dangle" / "new", "-k", fx.root / "new.key"])[1],
-            "output parent cyclic": lambda fx: ((fx.root / "cycle").symlink_to("cycle"), ["--output", fx.root / "cycle" / "new", "-k", fx.root / "new.key"])[1],
-            "output parent file": lambda fx: ((fx.root / "file").write_bytes(b"x"), ["--output", fx.root / "file" / "new", "-k", fx.root / "new.key"])[1],
-            "output dot": lambda fx: ["--output", ".", "-k", fx.root / "new.key"],
-            "output trailing dot": lambda fx: ["--output", "newdir/.", "-k", fx.root / "new.key"],
-            "output dotdot": lambda fx: ["--output", "service/..", "-k", fx.root / "new.key"],
-            "output empty": lambda fx: ["--output", "", "-k", fx.root / "new.key"],
-            "key inside source": lambda fx: ["--output", fx.root / "new", "-k", fx.directory / "new.key"],
-            "key inside destination": lambda fx: ["--output", fx.root / "new", "-k", fx.root / "new" / "new.key"],
-            "key equals destination": lambda fx: ["--output", fx.root / "new", "-k", fx.root / "new"],
-            "key equals old key": lambda fx: ["--output", fx.root / "new", "-k", fx.root / "service.key"],
-            "key dir missing": lambda fx: ["--output", fx.root / "new", "-K", fx.root / "nokeys"],
-            "key dir is source": lambda fx: ["--output", fx.root / "new", "-K", fx.directory],
-            "default store in source": lambda fx: (fx.env.__setitem__("XDG_DATA_HOME", str(fx.directory / "xdg")), ["--output", fx.root / "new"])[1],
-            "default store in destination": lambda fx: (fx.env.__setitem__("XDG_DATA_HOME", str(fx.root / "new" / "xdg")), ["--output", fx.root / "new"])[1],
+            "dangling key file": lambda fx: (fx.root / "new.key").symlink_to("nowhere"),
+            "default store after bad entry": lambda fx: ((fx.directory / "BAD").write_bytes(b"encrypted:B!!!\n"), [])[1],
+            "key inside envdir": lambda fx: ["-k", fx.directory / "new.key"],
+            "key inside envdir alias": lambda fx: ((fx.root / "alias").symlink_to(fx.directory), ["-k", fx.root / "alias" / "new.key"])[1],
+            "key equals envdir": lambda fx: ["-k", fx.directory],
+            "key equals old key": lambda fx: ["-k", fx.root / "service.key"],
+            "key dir missing": lambda fx: ["-K", fx.root / "nokeys"],
+            "key dir is envdir": lambda fx: ["-K", fx.directory],
+            "default store in envdir": lambda fx: (fx.env.__setitem__("XDG_DATA_HOME", str(fx.directory / "xdg")), [])[1],
+            "parent not writable": readonly_parent,
         }
         for label, mutate in cases.items():
             with self.subTest(label):
                 fx = Fixture(self)
                 self.mixed(fx)
                 args = mutate(fx)
-                args = args if isinstance(args, list) else []
-                if not any(arg == "--output" for arg in args):
-                    args = ["--output", fx.root / "new", "-k", fx.root / "new.key", *args]
-                existed = os.path.lexists(fx.root / "new")
+                args = args if isinstance(args, list) else ["-k", new_key(fx)]
                 self.fails(fx, *args)
                 self.assertFalse((fx.home / ".local").exists(), "default store is not created")
                 self.assertFalse((fx.root / "xdg").exists())
-                if not existed:
-                    self.assertFalse(os.path.lexists(fx.root / "new"))
-                self.assertEqual([p.name for p in fx.root.iterdir() if p.name.startswith(".envdirx-")], [])
+                self.assertEqual(self.residue(fx), [])
+
+    def test_unsafe_rotation_targets_write_nothing(self):
+        fx = Fixture(self)
+        self.mixed(fx)
+        (fx.root / "alias").symlink_to(fx.directory)
+        for label, kwargs in (
+            ("cwd is DIR", {"cwd": fx.directory}),
+            ("cwd inside DIR", {"cwd": fx.directory / "sub"}),
+            ("cwd inside DIR through alias", {"cwd": fx.root / "alias" / "sub"}),
+            ("filesystem root", {"directory": Path("/")}),
+        ):
+            with self.subTest(label):
+                (fx.directory / "sub").mkdir(exist_ok=True)  # would be refused as an entry, but the target check comes first
+                result = self.fails(fx, "-k", fx.root / "new.key", **kwargs)
+                self.assertIn(b"current directory" if "cwd" in label else b"root or mountpoint", result.stderr)
+        (fx.directory / "sub").rmdir()
+        with mock.patch.object(envdirx.os.path, "ismount", side_effect=lambda path: Path(path) == fx.directory):
+            before = fx.snapshot()
+            code, stderr, writes = self.main(fx, ["-k", fx.root / "new.key"])
+            self.assertEqual((code, writes), (111, []))
+            self.assertIn(b"mountpoint", stderr)
+            self.assertEqual(fx.snapshot(), before)
 
     def test_missing_source_fails(self):
         fx = Fixture(self)
         self.sentinel, self.plain = b"unused-sentinel", {}
         fx.directory.rmdir()
-        self.fails(fx, "--output", fx.root / "new", "-k", fx.root / "new.key")
+        self.fails(fx, "-k", fx.root / "new.key")
 
     def test_parser_errors_write_nothing(self):
         fx = Fixture(self)
         self.mixed(fx)
-        new, key = str(fx.root / "new"), str(fx.root / "new.key")
-        for args in ([], ["-k", key], ["--output", new, "-k", key, "-K", str(fx.root)], ["-o", new], ["--output", new, "--bogus"], ["--output", new, "-K"]):
+        key = str(fx.root / "new.key")
+        for args in (["--output", str(fx.root / "new")], ["--output"], ["--output", ""], ["--output=x", "-k", key], ["--key", str(self.old_key), "--output", "x"]):
+            with self.subTest(args=args):
+                result = self.fails(fx, *args, code=2)
+                self.assertIn(b"--output was removed: rekey now rotates the key in place at DIR (use -d DIR)", result.stderr)
+        for args in (["-k", key, "-K", str(fx.root)], ["-o", "new"], ["--bogus"], ["-K"], ["-k"], ["--key"], ["extra"]):
             with self.subTest(args=args):
                 self.fails(fx, *args, code=2)
         before = fx.snapshot()
-        result = fx.call("-d", fx.directory, "-d", fx.root, "rekey", "--output", new, "-k", key)
+        result = fx.call("-d", fx.directory, "-d", fx.root, "rekey", "-k", key)
         self.assertEqual((result.returncode, result.stdout), (2, b""))
         self.assertEqual(fx.snapshot(), before)
 
@@ -1850,9 +1908,9 @@ class RekeyTest(unittest.TestCase):
         self.mixed(fx)
         fx.directory.rename(fx.root / ".envs")
         fx.directory = fx.root / ".envs"
-        result = fx.call("rekey", "--output", "new", "-k", "new.key")
+        result = fx.call("rekey", "-k", "new.key")
         self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
-        self.assert_rotated(fx, fx.root / "new", fx.root / "new.key")
+        self.assert_rotated(fx, fx.root / "new.key")
 
     def main(self, fx, args, patches=(), environ=None):
         """Run main() in-process; record every write; return (code, stderr, writes)."""
@@ -1904,19 +1962,49 @@ class RekeyTest(unittest.TestCase):
         fx = Fixture(self)
         self.mixed(fx)
         before = fx.snapshot()
-        new, key = fx.root / "new", fx.root / "new.key"
-        code, stderr, writes = self.main(fx, ["--output", new, "-k", key])
+        key = fx.root / "new.key"
+        code, stderr, writes = self.main(fx, ["-k", key])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(writes[0], (key, key.read_bytes()))
         staged = {path.name for path, _ in writes[1:]}
-        self.assertEqual(staged, {p.name for p in new.iterdir()})
+        self.assertEqual(staged, {p.name for p in fx.directory.iterdir()})
         self.assertTrue(all(path.parent.name.startswith(".envdirx-rekey-") and path.parent.parent == fx.root for path, _ in writes[1:]))
-        created = set(fx.snapshot()) - set(before)
-        self.assertEqual(created, {key, new, *(new / name for name in staged)})
-        self.assert_rotated(fx, new, key)
+        self.assertEqual(set(fx.snapshot()) - set(before), {key})
+        self.assert_rotated(fx, key)
         self.assert_clean(fx, subprocess.CompletedProcess([], 0, b"", stderr))
 
-    def test_injected_late_failures_publish_nothing(self):
+    def exchange_wrapper(self, fx, before=None, after=None, probe=None):
+        """Patch _exchange: run BEFORE/AFTER around the real publication swap, PROBE instead of the probe swap."""
+        real = envdirx._exchange
+
+        def exchange(a, b):
+            if Path(a) != fx.directory:
+                return probe(a, b) if probe else real(a, b)
+            if before:
+                before(a, b)
+            real(a, b)
+            if after:
+                after(a, b)
+        return mock.patch.object(envdirx, "_exchange", exchange)
+
+    @staticmethod
+    def raiser(exc):
+        def fail(*args, **kwargs):
+            raise exc
+        return fail
+
+    @staticmethod
+    def fail_directory_fsync(match):
+        real = os.fsync
+
+        def fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode) and match(st):
+                raise OSError(errno.EINVAL, "Invalid argument")
+            return real(fd)
+        return mock.patch.object(envdirx.os, "fsync", fsync)
+
+    def test_injected_failures_before_commit_change_nothing(self):
         def fail_create(predicate):
             real = envdirx._create
 
@@ -1926,56 +2014,206 @@ class RekeyTest(unittest.TestCase):
                 return real(path, data, mode)
             return mock.patch.object(envdirx, "_create", create)
 
-        def appear(fx):
-            real = envdirx._create
+        def fail_mkdtemp(prefix):
+            real = tempfile.mkdtemp
 
-            def create(path, data, mode):
-                real(path, data, mode)
-                if Path(path).name == "VOID":  # last staged entry: DEST appears before publication
-                    (fx.root / "new").mkdir()
-            return mock.patch.object(envdirx, "_create", create)
+            def mkdtemp(*args, **kwargs):
+                if kwargs.get("prefix") == prefix:
+                    raise OSError(13, "Permission denied")
+                return real(*args, **kwargs)
+            return mock.patch.object(envdirx.tempfile, "mkdtemp", mkdtemp)
 
         real_encrypt = envdirx._encrypt
+        root = lambda fx: (fx.root.stat().st_dev, fx.root.stat().st_ino)
         cases = {
-            "new key write": lambda fx: [fail_create(lambda p: p.name == "new.key")],
+            "verification": lambda fx: [mock.patch.object(envdirx, "_encrypt", lambda data, name, public: real_encrypt(data + b"!", name, public))],
+            "probe unsupported": lambda fx: [self.exchange_wrapper(fx, probe=self.raiser(OSError(errno.ENOTSUP, "Operation not supported")))],
+            "probe missing symbol": lambda fx: [self.exchange_wrapper(fx, probe=self.raiser(ValueError(envdirx.EXCHANGE_UNSUPPORTED)))],
+            "probe directory": lambda fx: [fail_mkdtemp(".envdirx-probe-")],
+            "new key write": lambda fx: [fail_create(lambda p: p.suffix == ".key" and p.parent.name in ("keys", fx.root.name))],
+            "staging directory": lambda fx: [fail_mkdtemp(".envdirx-rekey-")],
             "public key write": lambda fx: [fail_create(lambda p: p.name == ".envdirx.pub")],
             "pointer write": lambda fx: [mock.patch.object(envdirx, "_link", side_effect=OSError(5, "I/O error"))],
             "first entry write": lambda fx: [fail_create(lambda p: p.name == "BIN")],
-            "later entry write": lambda fx: [fail_create(lambda p: p.name == "SENTINEL")],
-            "staging directory": lambda fx: [mock.patch.object(envdirx.tempfile, "mkdtemp", side_effect=OSError(13, "Permission denied"))],
-            "verification": lambda fx: [mock.patch.object(envdirx, "_encrypt", lambda data, name, public: real_encrypt(data + b"!", name, public))],
-            "publication": lambda fx: [mock.patch.object(envdirx.os, "rename", side_effect=OSError(18, "Cross-device link"))],
-            "destination appears": lambda fx: [appear(fx)],
+            "later entry write": lambda fx: [fail_create(lambda p: p.name == "VOID")],
+            "staging fsync": lambda fx: [self.fail_directory_fsync(lambda st: (st.st_dev, st.st_ino) != root(fx))],
+            "final swap unsupported": lambda fx: [self.exchange_wrapper(fx, before=self.raiser(OSError(errno.EXDEV, "Cross-device link")))],
+            "interrupt before swap": lambda fx: [self.exchange_wrapper(fx, before=self.raiser(KeyboardInterrupt()))],
         }
         for label, patches in cases.items():
             for store in ("keyfile", "default"):
                 with self.subTest(label, store=store):
                     fx = Fixture(self)
-                    self.mixed(fx)
-                    before = self.source_state(fx)
-                    args = ["--output", fx.root / "new"] + (["-k", fx.root / "new.key"] if store == "keyfile" else [])
+                    self.mixed(fx, 0o500, 0o444)
+                    before = fx.snapshot()
+                    args = ["-k", fx.root / "new.key"] if store == "keyfile" else []
                     environ = {"XDG_DATA_HOME": str(fx.root / "xdg")} if store == "default" else None
-                    if store == "default" and label == "new key write":
-                        patch_list = [fail_create(lambda p: p.suffix == ".key" and p.parent.name == "keys")]
-                    else:
-                        patch_list = patches(fx)
-                    code, stderr, writes = self.main(fx, args, patch_list, environ)
+                    code, stderr, writes = self.main(fx, args, patches(fx), environ)
                     self.assertEqual(code, 111, stderr)
                     self.assertTrue(stderr.startswith(b"envdirx: "), stderr)
-                    self.assertEqual(self.source_state(fx), before, "source, old key and HOME unchanged")
-                    if label == "destination appears":
-                        self.assertEqual(list((fx.root / "new").iterdir()), [], "concurrent directory is left alone")
-                    else:
-                        self.assertFalse(os.path.lexists(fx.root / "new"))
-                    self.assertFalse(os.path.lexists(fx.root / "new.key"))
-                    if store == "default":
-                        keys = fx.root / "xdg" / "envdirx" / "keys"
-                        self.assertEqual(list(keys.iterdir()) if keys.exists() else [], [], "new key removed; empty store may remain")
-                    self.assertEqual([p.name for p in fx.root.iterdir() if p.name.startswith(".envdirx-")], [])
-                    if label in ("later entry write", "destination appears"):
+                    self.assertNotIn(b"rotation completed", stderr)
+                    after = fx.snapshot()
+                    keys = fx.root / "xdg" / "envdirx" / "keys"
+                    self.assertEqual(list(keys.iterdir()) if keys.exists() else [], [], "new key removed; empty store may remain")
+                    self.assertEqual({p: v for p, v in after.items() if not envdirx._inside(p, fx.root / "xdg")}, before, "envdir and old key unchanged")
+                    self.assertEqual(fx.directory.stat().st_mode & 0o777, 0o500)
+                    self.assertEqual(self.residue(fx), [])
+                    if label.startswith("probe"):
+                        self.assertFalse((fx.root / "xdg").exists(), "probe precedes the default store")
+                        self.assertIn(b"exchange", stderr)
+                    if label == "interrupt before swap":
+                        self.assertIn(b"interrupted before publication", stderr)
+                    if label == "later entry write":
                         self.assertIn("BIN", {path.name for path, _ in writes}, "an earlier entry was staged first")
                     self.assert_clean(fx, subprocess.CompletedProcess([], 111, b"", stderr))
                     fx.run_ok()
+
+    def test_injected_failures_after_commit_keep_new_key(self):
+        root = lambda fx: (fx.root.stat().st_dev, fx.root.stat().st_ino)
+        cases = {
+            "parent fsync": (lambda fx: [self.fail_directory_fsync(lambda st: (st.st_dev, st.st_ino) == root(fx))], False),
+            "old tree cleanup": (lambda fx: [mock.patch.object(envdirx.shutil, "rmtree", side_effect=OSError(errno.EBUSY, "Resource busy"))], True),
+            "interrupt after swap": (lambda fx: [self.exchange_wrapper(fx, after=self.raiser(KeyboardInterrupt()))], True),
+            "interrupt during cleanup": (lambda fx: [mock.patch.object(envdirx.shutil, "rmtree", side_effect=KeyboardInterrupt())], True),
+        }
+        for label, (patches, leftover) in cases.items():
+            with self.subTest(label):
+                fx = Fixture(self)
+                self.mixed(fx, 0o500, 0o444)
+                key = fx.root / "new.key"
+                code, stderr, _ = self.main(fx, ["-k", key], patches(fx))
+                self.assertEqual(code, 111, stderr)
+                self.assertTrue(stderr.startswith(b"envdirx: rotation completed: "), stderr)
+                self.assertIn(str(key).encode(), stderr)
+                self.assertNotIn(b"rolled back", stderr)
+                residue = self.residue(fx)
+                if leftover:
+                    self.assertEqual(len(residue), 1)
+                    self.assertIn(str(residue[0]).encode(), stderr, "the safe residue path is reported")
+                    self.assertEqual(os.readlink(residue[0] / ".envdirx.key"), str(self.old_key), "residue is the previous envdir")
+                    self.assertEqual((residue[0] / "TOKEN").read_bytes(), self.old_ciphertext["TOKEN"])
+                    envdirx._remove_tree(residue[0])
+                self.assert_rotated(fx, key)
+                fx.run_ok()
+                self.assert_clean(fx, subprocess.CompletedProcess([], 111, b"", stderr))
+
+    def test_unknown_commit_state_retains_everything(self):
+        fx = Fixture(self)
+        self.mixed(fx)
+        key = fx.root / "new.key"
+
+        def replace_envdir(a, b):
+            fx.directory.rename(fx.root / "moved")
+            fx.directory.mkdir()
+            raise OSError(errno.EIO, "I/O error")
+
+        code, stderr, _ = self.main(fx, ["-k", key], [self.exchange_wrapper(fx, before=replace_envdir)])
+        self.assertEqual(code, 111, stderr)
+        self.assertIn(b"rotation state is unknown", stderr)
+        self.assertTrue(key.exists(), "a possibly active key is kept")
+        self.assertEqual(len(self.residue(fx)), 1, "the staged tree is kept")
+        self.assertEqual(os.readlink(self.residue(fx)[0] / ".envdirx.key"), str(key))
+
+    def test_sigkill_barriers_keep_a_complete_active_envdir(self):
+        for when in ("before", "after"):
+            with self.subTest(when=when):
+                fx = Fixture(self)
+                self.mixed(fx)
+                key = fx.root / "new.key"
+                result = subprocess.run([sys.executable, "-c", BARRIER, str(fx.directory), when, "-d", str(fx.directory), "rekey", "-k", str(key)],
+                                        env=fx.env, capture_output=True, cwd=fx.root, timeout=30)
+                self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+                self.assertTrue(fx.directory.is_dir(), "the active path never disappears")
+                residue = self.residue(fx)
+                self.assertEqual(len(residue), 1, "the staged or previous tree remains")
+                self.assertTrue(key.exists(), "the new key remains in both cases")
+                active, other = (self.old_key, key) if when == "before" else (key, self.old_key)
+                self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(active))
+                self.assertEqual(os.readlink(residue[0] / ".envdirx.key"), str(other))
+                for name, value in {**self.encrypted, **self.plain}.items():
+                    got = fx.on("get", name)  # a fresh, independent reader of the unchanged path
+                    self.assertEqual((got.returncode, got.stdout), (0, value), got.stderr)
+                fx.run_ok()
+                if when == "after":
+                    envdirx._remove_tree(residue[0])
+                    self.assert_rotated(fx, key)
+                else:
+                    self.assertEqual({name: (fx.directory / name).read_bytes() for name in self.encrypted}, self.old_ciphertext)
+                self.assert_clean(fx, result)
+
+
+class NativeExchangeUnitTest(unittest.TestCase):
+    """ABI binding and error mapping of the native exchange with fake libc objects; no syscall is made."""
+
+    class Function:
+        def __init__(self, result=0):
+            self.result, self.calls = result, []
+
+        def __call__(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    def test_darwin_binding(self):
+        libc = types.SimpleNamespace(renamex_np=self.Function())
+        envdirx._native_exchange("darwin", libc)(b"a", b"b")
+        self.assertEqual(libc.renamex_np.calls, [(b"a", b"b", 2)])
+        self.assertEqual(libc.renamex_np.argtypes, (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint))
+        self.assertIs(libc.renamex_np.restype, ctypes.c_int)
+
+    def test_linux_binding(self):
+        libc = types.SimpleNamespace(renameat2=self.Function())
+        envdirx._native_exchange("linux", libc)(b"a", b"b")
+        self.assertEqual(libc.renameat2.calls, [(-100, b"a", -100, b"b", 2)])
+        self.assertEqual(libc.renameat2.argtypes, (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint))
+        self.assertIs(libc.renameat2.restype, ctypes.c_int)
+
+    def test_missing_symbol_and_platform_fail_closed(self):
+        both = types.SimpleNamespace(renamex_np=self.Function(), renameat2=self.Function())
+        for platform, libc in (("darwin", types.SimpleNamespace()), ("linux", types.SimpleNamespace()), ("win32", both), ("freebsd14", both)):
+            with self.subTest(platform=platform):
+                with self.assertRaisesRegex(ValueError, "^atomic directory exchange is not supported on this platform/libc$"):
+                    envdirx._native_exchange(platform, libc)
+        self.assertEqual(both.renamex_np.calls + both.renameat2.calls, [], "no fallback call")
+
+    def test_errno_becomes_oserror(self):
+        libc = types.SimpleNamespace(renamex_np=self.Function(-1), renameat2=self.Function(-1))
+        with mock.patch.object(envdirx.ctypes, "CDLL", return_value=libc) as cdll, \
+                mock.patch.object(envdirx.ctypes, "get_errno", return_value=errno.ENOTSUP):
+            with self.assertRaises(OSError) as caught:
+                envdirx._exchange(Path("/x/a"), Path("/x/b"))
+        cdll.assert_called_once_with(None, use_errno=True)
+        exc = caught.exception
+        self.assertEqual((exc.errno, exc.strerror, exc.filename, exc.filename2), (errno.ENOTSUP, os.strerror(errno.ENOTSUP), "/x/a", "/x/b"))
+
+    def test_commit_state(self):
+        with mock.patch.object(envdirx, "_identity", return_value=(1, 2)):
+            self.assertIs(envdirx._commit_state(Path("d"), (1, 1), (1, 2)), True)
+            self.assertIs(envdirx._commit_state(Path("d"), (1, 2), None), False)
+            self.assertIs(envdirx._commit_state(Path("d"), (1, 1), (1, 3)), None)
+        with mock.patch.object(envdirx, "_identity", side_effect=FileNotFoundError):
+            self.assertIsNone(envdirx._commit_state(Path("d"), (1, 1), (1, 2)))
+
+
+class NativeExchangeHostTest(unittest.TestCase):
+    """Integration: the host libc exchange really runs (this does not stand in for the other platform)."""
+
+    def test_real_exchange_and_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a", Path(tmp) / "b"
+            a.mkdir()
+            b.mkdir()
+            (a / "f").write_bytes(b"A")
+            (b / "f").write_bytes(b"B")
+            ids = (os.lstat(a).st_ino, os.lstat(b).st_ino)
+            envdirx._exchange(a, b)
+            self.assertEqual(((a / "f").read_bytes(), (b / "f").read_bytes()), (b"B", b"A"))
+            self.assertEqual((os.lstat(a).st_ino, os.lstat(b).st_ino), ids[::-1])
+            with self.assertRaises(OSError) as caught:
+                envdirx._exchange(a, Path(tmp) / "missing")
+            self.assertEqual(caught.exception.errno, errno.ENOENT)
+            self.assertEqual(((a / "f").read_bytes(), (b / "f").read_bytes()), (b"B", b"A"))
+            envdirx._probe_exchange(Path(tmp))
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["a", "b"], "probes removed")
 
 
 class KeyMetadataUnitTest(unittest.TestCase):
