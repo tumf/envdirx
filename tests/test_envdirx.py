@@ -562,6 +562,10 @@ class EnvdirxTest(unittest.TestCase):
         for text in ("旧鍵を指す", "平文のまま残る", "ディスクに書いたり表示したりすることはない", "認証情報も更新する", "そのまま使える"):
             self.assertIn(text, readme_ja)
         self.assertIn("Its `--key` is the OLD key", skill)
+        self.assertNotIn("ciphertext only", readme)
+        self.assertNotIn("暗号文のみ", readme_ja)
+        self.assertIn("staged copies of existing plaintext entries", readme)
+        self.assertIn("既存の平文エントリのコピーが含まれる", readme_ja)
         version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
         for text, heading in ((readme, "## Versioning and releases"), (readme_ja, "## バージョンとリリース")):
             section = text.split(heading, 1)[1].split("\n## ", 1)[0]
@@ -1597,6 +1601,7 @@ class RekeyTest(unittest.TestCase):
         plain = {"PLAIN": b"plain-value\n", "EMPTY": b""}
         for name, value in plain.items():
             (fx.directory / name).write_bytes(value)
+            (fx.directory / name).chmod(0o644)
         self.encrypted, self.plain = encrypted, plain
         self.old_key = fx.root / "service.key"
 
@@ -1642,6 +1647,8 @@ class RekeyTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in new.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *names]))
         for name, value in self.plain.items():
             self.assertEqual((new / name).read_bytes(), value)
+            self.assertEqual((new / name).stat().st_mode & 0o777, 0o600, name)
+            self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o644, name)
         for name, value in self.encrypted.items():
             stored = (new / name).read_bytes()
             self.assertTrue(stored.startswith(envdirx.MAGIC) and stored.endswith(b"\n"), name)
@@ -1708,6 +1715,7 @@ class RekeyTest(unittest.TestCase):
                 fx = Fixture(self)
                 for name, value in contents.items():
                     (fx.directory / name).write_bytes(value)
+                    (fx.directory / name).chmod(0o644)
                 (fx.directory / ".envdirx.key").symlink_to("missing")  # never read without ciphertext
                 before = fx.snapshot()
                 result = self.rekey(fx, "--output", fx.root / "new", "--key", fx.root / "missing.key", "-k", fx.root / "new.key")
@@ -1716,6 +1724,8 @@ class RekeyTest(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in new.iterdir()), sorted([".envdirx.key", ".envdirx.pub", *contents]))
                 for name, value in contents.items():
                     self.assertEqual((new / name).read_bytes(), value)
+                    self.assertEqual((new / name).stat().st_mode & 0o777, 0o600, name)
+                    self.assertEqual((fx.directory / name).stat().st_mode & 0o777, 0o644, name)
                 self.assertEqual(_public_of(fx.root / "new.key"), (new / ".envdirx.pub").read_bytes())
                 self.assertEqual({p: v for p, v in fx.snapshot().items() if p.name not in ("new.key",) and new not in (p, *p.parents)}, before)
 
