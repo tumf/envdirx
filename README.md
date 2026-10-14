@@ -4,7 +4,7 @@
 
 `envdirx` is a CLI that keeps the DJB `envdir` convention: one file per environment variable. `set` stores plaintext by default; `set -c` encrypts. Plaintext and encrypted entries can coexist, and `run` reads both. An encrypted entry named `GOG_KEYRING_PASSWORD` has printable `encrypted:B...` Base64 text inside its file, **not** a `GOG_KEYRING_PASSWORD=` line. Existing binary `envdirx:v1:` entries remain readable; new writes use the printable format with one trailing LF. Readers also accept no trailing LF; embedded or repeated newlines and CRLF are rejected. It serves a similar purpose to dotenvx, but its ciphertext and keys are **not compatible**.
 
-Requires Python 3.13 or newer on POSIX. The default envdir is `./.envs` relative to the current working directory. Put `-d/--directory DIRECTORY` **before** the subcommand. Only `mkdir` creates the envdir; other commands require it to exist.
+Requires Python 3.13 or newer on POSIX. By default, envdirx uses `./.envs` in the current directory. Only `mkdir` creates it; other commands require it to exist.
 
 Licensed under the [MIT License](LICENSE).
 
@@ -24,19 +24,21 @@ envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 
 Do not put real secrets on a shell command line: supply them from a file or standard input instead of `printf` literals.
 
-| Command | Action |
-| --- | --- |
-| `envdirx --version` / `envdirx -V` | Print the installed envdirx version and one newline, then exit 0. Like `-d`, it goes before any subcommand and needs no envdir or key. |
-| `envdirx [-d D] mkdir` | Create the envdir and missing parents; a new envdir has mode 0700. An existing directory is left unchanged; a non-directory fails with status 111. |
-| `envdirx [-d D] keygen [-k KEYFILE \| -K KEYDIR]` | Create a key pair and the `.envdirx.key` symlink; without options the private key goes to the default key directory. |
-| `envdirx [-d D] set [-c] NAME` | Store stdin unchanged as plaintext, or encrypt with `-c`. |
-| `envdirx [-d D ...] get [--key KEY] NAME` | Search envdirs in priority order and write the first entry’s original bytes to stdout. |
-| `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)` | Encrypt existing plaintext entries in place, using only the public key. |
-| `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)` | Restore encrypted entries to plaintext files, using the private key. |
-| `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]` | Write a complete copy of the envdir to a new directory under a fresh key; the source and old key are left unchanged. |
-| `envdirx [-d D] run [--key KEY] -- COMMAND [ARGS...]` | Execute a command with the envdir applied. |
+The quick start creates `./.envs` and a private key outside it (in `~/.local/share/envdirx/keys`, or under an absolute `XDG_DATA_HOME`). `keygen` records the key path in `./.envs/.envdirx.key`; `run` and `get` use that pointer automatically. Back up the private key separately. `set AAA` writes plaintext; `set -c API_TOKEN` encrypts. `run -- COMMAND` applies both entries to the child process. Quote the `sh -c` program with single quotes so the calling shell does not expand the variables.
 
-For an explicit directory and key file:
+| Command (default envdir) | Action |
+| --- | --- |
+| `envdirx mkdir` | Create `./.envs` and missing parents (mode 0700 for a new envdir). |
+| `envdirx keygen` | Create a key pair outside the envdir and a `.envdirx.key` pointer inside it. |
+| `envdirx set NAME` / `envdirx set -c NAME` | Store stdin as plaintext / encrypted. |
+| `envdirx get NAME` | Write the original bytes to stdout; redirect secrets away from terminals and logs. |
+| `envdirx encrypt NAME` / `envdirx encrypt --all` | Encrypt existing plaintext entries in place. |
+| `envdirx decrypt NAME` / `envdirx decrypt --all` | Restore ciphertext to plaintext **on disk**. |
+| `envdirx rekey --output DEST` | Copy the envdir under a fresh key; the original stays unchanged. |
+| `envdirx run -- COMMAND [ARGS...]` | Execute a command with the envdir applied. |
+| `envdirx --version` / `envdirx -V` | Print the installed version without reading the envdir. |
+
+For a different directory, put `-d/--directory DIRECTORY` **before** the subcommand. `keygen -k KEYFILE` chooses a private-key file; `-K KEYDIR` chooses an existing key directory. `run`, `get`, and `decrypt` use the pointer unless `--key KEYFILE` overrides it. For example:
 
 ```sh
 envdirx -d service.env mkdir
@@ -45,7 +47,13 @@ printf 'example-token\n' | envdirx -d service.env set -c API_TOKEN
 envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TOKEN" = example-token'
 ```
 
-Quote the `sh -c` program with single quotes so the calling shell does not expand the variables.
+Advanced command forms (options are shown here after the default workflow):
+
+- `envdirx [-d D] keygen [-k KEYFILE \| -K KEYDIR]`
+- `envdirx [-d D ...] get [--key KEY] NAME`
+- `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)`
+- `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)`
+- `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
 
 ## Storing and reading values
 

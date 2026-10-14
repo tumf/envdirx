@@ -2,7 +2,7 @@
 
 DJB `envdir` の1ファイル1変数を保つ CLI。値は既定で平文のまま保存し、`set -c` を付けたものだけを暗号化する。平文と暗号文のエントリは同じディレクトリに混在でき、`run` はどちらも読む。暗号文はファイル名を変数名とし、ファイル内容を `encrypted:B...`（Base64テキスト）とする。例えば `GOG_KEYRING_PASSWORD` ファイルの中身が `encrypted:B...` となる。ファイル内に `GOG_KEYRING_PASSWORD=` は書かない。dotenvx と同じ暗号形式・鍵形式ではない。従来の `envdirx:v1:` 暗号文も読み込めるが、新規書き込みは新形式となり、末尾にLFを1つ付ける。改行なしの暗号文も読み込めるが、途中の改行、複数の末尾改行、CRLFは拒否する。
 
-envdir は `-d/--directory DIRECTORY` で指定し、**サブコマンドより前**に置く。省略時はカレントディレクトリ基準の `./.envs`。ディレクトリを作るのは `mkdir` だけで、他のコマンドは既存のディレクトリを要求する。
+既定ではカレントディレクトリの `./.envs` を使う。ディレクトリを作るのは `mkdir` だけで、他のコマンドは既存のディレクトリを要求する。外部の envdir を指定する `-d` は後述。
 
 [MIT License](LICENSE)で配布します。
 
@@ -18,19 +18,21 @@ envdirx get AAA > /dev/null
 envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 ```
 
-| コマンド | 動作 |
-| --- | --- |
-| `envdirx --version` / `envdirx -V` | インストール済み envdirx のバージョンと改行1つを出力して終了コード 0。`-d` と同じくサブコマンドより前に置き、envdir も鍵も不要 |
-| `envdirx [-d D] mkdir` | 親を含めて作成。新規 envdir は 0700。既存ディレクトリは何も変えず成功、ディレクトリ以外があれば 111 |
-| `envdirx [-d D] keygen [-k KEYFILE \| -K KEYDIR]` | 鍵ペアと `.envdirx.key` シンボリックリンクを作成。オプションなしなら秘密鍵は既定の鍵ディレクトリへ |
-| `envdirx [-d D] set [-c] NAME` | 標準入力をそのまま保存（既定は平文、`-c` で暗号化） |
-| `envdirx [-d D ...] get [--key KEY] NAME` | 指定順に envdir を検索し、最初に見つかった値の元のバイト列を標準出力へ |
-| `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)` | 既存の平文エントリをその場で暗号化（公開鍵のみ使用） |
-| `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)` | 暗号化エントリをその場で平文に戻す（秘密鍵のみ使用） |
-| `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]` | 新しい鍵で envdir 全体を新しいディレクトリへ書き出す。元の envdir と旧鍵は変更しない |
-| `envdirx [-d D] run [--key KEY] -- COMMAND [ARGS...]` | envdir を適用してコマンドを実行 |
+クイックスタートでは `./.envs` を作り、秘密鍵をその外（`~/.local/share/envdirx/keys`、または絶対パスの `XDG_DATA_HOME` 配下）に保存する。`keygen` が `./.envs/.envdirx.key` に鍵の参照先を記録し、`run` と `get` は自動で参照する。秘密鍵は別途バックアップする。`set AAA` は平文、`set -c API_TOKEN` は暗号文を保存し、`run -- COMMAND` は両方を子プロセスに適用する。例の `sh -c '...'` は単一引用符で囲み、変数を呼び出し側のシェルで展開しない。
 
-明示的なディレクトリと鍵ファイルを使う例:
+| コマンド（既定の envdir） | 動作 |
+| --- | --- |
+| `envdirx mkdir` | `./.envs` と不足する親を作成（新規 envdir は 0700） |
+| `envdirx keygen` | 秘密鍵を envdir の外に作り、内部に `.envdirx.key` の参照を作成 |
+| `envdirx set NAME` / `envdirx set -c NAME` | 標準入力を平文 / 暗号文として保存 |
+| `envdirx get NAME` | 元のバイト列を標準出力へ。秘密は端末・ログへ出さない |
+| `envdirx encrypt NAME` / `envdirx encrypt --all` | 既存の平文をその場で暗号化 |
+| `envdirx decrypt NAME` / `envdirx decrypt --all` | 暗号文を**ディスク上の平文**に戻す |
+| `envdirx rekey --output DEST` | 新しい鍵で別の envdir へコピー。元の envdir は変更しない |
+| `envdirx run -- COMMAND [ARGS...]` | envdir を適用してコマンドを実行 |
+| `envdirx --version` / `envdirx -V` | envdir を読まずにインストール済みバージョンを表示 |
+
+別の envdir を使う場合は `-d/--directory DIRECTORY` を**サブコマンドより前**に置く。`keygen -k KEYFILE` で秘密鍵のファイルを、`-K KEYDIR` で既存の鍵ディレクトリを指定できる。`run`・`get`・`decrypt` は通常ポインタを使い、`--key KEYFILE` を付けた場合はそちらを優先する。例:
 
 ```sh
 envdirx -d service.env mkdir
@@ -40,6 +42,14 @@ envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TO
 ```
 
 値はシェルの引数ではなく標準入力から渡す。例の `sh -c '...'` は単一引用符で囲み、変数を呼び出し側のシェルで展開しない。
+
+オプション付きのコマンド形式（既定の手順の後に掲載）:
+
+- `envdirx [-d D] keygen [-k KEYFILE \| -K KEYDIR]`
+- `envdirx [-d D ...] get [--key KEY] NAME`
+- `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)`
+- `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)`
+- `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
 
 ## `set`: 平文が既定、暗号化は `-c`
 
