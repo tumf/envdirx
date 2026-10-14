@@ -34,7 +34,7 @@ The quick start creates `./.envs` and a private key outside it (in `~/.local/sha
 | `envdirx get NAME` | Write the original bytes to stdout; redirect secrets away from terminals and logs. |
 | `envdirx encrypt NAME` / `envdirx encrypt --all` | Encrypt existing plaintext entries in place. |
 | `envdirx decrypt NAME` / `envdirx decrypt --all` | Restore ciphertext to plaintext **on disk**. |
-| `envdirx rekey --output DEST` | Copy the envdir under a fresh key; the original stays unchanged. |
+| `envdirx rekey` | Rotate the encryption key in place: re-encrypt the envdir under a fresh key at the same path. |
 | `envdirx run -- COMMAND [ARGS...]` | Execute a command with the envdir applied. |
 | `envdirx --version` / `envdirx -V` | Print the installed version without reading the envdir. |
 
@@ -53,7 +53,7 @@ Advanced command forms (options are shown here after the default workflow):
 - `envdirx [-d D ...] get [--key KEY] NAME`
 - `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)`
 - `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)`
-- `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
+- `envdirx [-d D] rekey [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
 
 ## Storing and reading values
 
@@ -118,32 +118,32 @@ Alternatively, if the pointer does not already exist, use `ln -s ../service.env.
 
 ## Rotating keys with `rekey`
 
-`envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]` rotates out of place: it generates a fresh X25519 key and writes a complete new envdir at `DEST`. It never changes or deletes `SOURCE` (default `./.envs`) or the old key, and it does not switch anything over for you.
+`envdirx [-d DIR] rekey [--key OLDKEY] [-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]` rotates the encryption key in place: it generates a fresh X25519 key, re-encrypts every encrypted entry, and replaces `DIR` (default `./.envs`) at the same path. Consumers keep using the same `-d DIR`; there is nothing to switch over. The old key is never modified or deleted. The earlier out-of-place form `rekey --output DEST` was removed: `--output` now exits 2 without writing anything.
 
-- **`--key OLDKEY` names the old key, unlike `keygen --key`, which names the new one.** It is used only to decrypt `SOURCE` (default: `SOURCE/.envdirx.key`) and is read only when `SOURCE` holds encrypted entries. `SOURCE/.envdirx.pub` is not needed.
-- The new private key goes to `-k/--new-key NEWKEYFILE`, to the existing `-K/--new-key-dir NEWKEYDIR` as `<sha256>.key`, or by default to the same default key directory as `keygen`. It must be outside both `SOURCE` and `DEST`, and existing files are never overwritten (no `-f`).
-- `DEST` must not exist (not even as a dangling symlink), its parent must already exist, and it must not be inside `SOURCE` or contain it, including through symlink aliases. Relative paths use the current directory; leading `~/` expands to home.
+- **`--key OLDKEY` names the old key, unlike `keygen --key`, which names the new one.** It is used only to decrypt `DIR` (default: `DIR/.envdirx.key`) and is read only when `DIR` holds encrypted entries. `DIR/.envdirx.pub` is not needed.
+- The new private key goes to `-k/--new-key NEWKEYFILE`, to the existing `-K/--new-key-dir NEWKEYDIR` as `<sha256>.key`, or by default to the same default key directory as `keygen`. It must be outside `DIR`, and existing files are never overwritten (no `-f`). Relative paths use the current directory; leading `~/` expands to home.
 - Encrypted entries (printable `encrypted:B` or older `envdirx:v1:`) are decrypted in memory, re-encrypted for the new key in the printable format, and verified with the new private key before anything is written. Values with a reserved prefix stay encrypted. **Decrypted values are never written to disk or printed.**
-- **Existing plaintext entries are copied unchanged and stay plaintext**, including empty (unset) entries; run `encrypt` on `DEST` afterwards if they should be encrypted.
+- **Existing plaintext entries are copied unchanged and stay plaintext**, keeping their bytes and mode, including empty (unset) entries; run `encrypt` afterwards if they should be encrypted.
 - Every visible entry must be a regular file with a valid name. Dotfiles other than `.envdirx.pub`/`.envdirx.key` are refused; those two are replaced by new metadata, never copied.
-- `DEST` gets mode 0700, a new `.envdirx.pub` (0644), a `.envdirx.key` symlink to the new key's absolute path, and 0600 entries. It is built in a private staging directory next to `DEST` and published with one rename.
+- `DIR` keeps its permission bits; re-encrypted entries are 0600, the new `.envdirx.pub` 0644, and `.envdirx.key` becomes a symlink to the new key's absolute path. If `-d` names a symlink, the link stays and its target is rotated.
+- `DIR` must not be a filesystem root or mountpoint or contain the current directory, and its parent must be writable. The rotated envdir is built in a private `.envdirx-rekey-*` staging directory next to `DIR` and swapped with `DIR` by one atomic directory exchange: `renamex_np` on macOS; on Linux the libc `renameat2` wrapper and a filesystem that supports `RENAME_EXCHANGE`. `rekey` first tries the exchange on two empty probe directories; where it is unavailable, `rekey` fails before creating a key. There is no non-atomic fallback.
 
-Any validation, key, or decryption error is detected before the default key directory, the new key, or the staging directory is created. A handled failure exits 111 with empty stdout and no values or key bytes in the error; nothing is published at `DEST`, and only the staging directory and new key created by this run are removed (a newly created, empty default key directory may remain). Success exits 0 with empty stdout. If the process is killed or the machine crashes, a `.envdirx-rekey-*` staging directory and the new key may be left behind; that directory holds re-encrypted entries and staged copies of existing plaintext entries, but never decrypted ciphertext values. `SOURCE` and the old key remain usable; this is not crash-proof atomic durability or secure erasure of memory. Like the rest of envdirx, it does not defend against concurrent changes to the directories by another process.
+Any validation, key, or decryption error is detected before the default key directory, the new key, or the staging directory is created. A failure before the exchange exits 111 with empty stdout and no values or key bytes in the error; `DIR` and the old key are unchanged, and only the staging directory and new key created by this run are removed (a newly created, empty default key directory may remain). The exchange is the commit point. If a later step fails (syncing the parent directory or removing the previous envdir), `rekey` exits 111 with a message starting `rotation completed`: `DIR` already uses the new key, which is kept, and the message names any directory left behind. Success exits 0 with empty stdout and leaves no staging directory.
+
+If the process is killed, `DIR` is never missing or half-replaced. Before the exchange it is still the original envdir, and a staging directory and the new key may remain; after it, it is the rotated envdir, and the previous envdir may remain as `.envdirx-rekey-*`, still pointing at the old key. Leftover directories hold ciphertext and staged copies of existing plaintext entries, but never decrypted ciphertext values. **Before deleting any leftover key or directory, check which key the active pointer names** (`readlink DIR/.envdirx.key`). This protects against process interruption only: it does not guarantee durability across power loss, secure erasure of memory, or preservation of ACLs, extended attributes, ownership, or the directory inode. Stop processes that write to `DIR` first; like the rest of envdirx, it does not defend against concurrent changes by another process. A process whose current directory or open directory handle is inside `DIR` keeps seeing the previous envdir. Readers running during the exchange may fail (closed, without printing values); readers started afterwards see the rotated envdir.
 
 ```sh
 envdirx -d app.env mkdir
 envdirx -d app.env keygen -k "$PWD/app.env.key"
 printf 'example-token' | envdirx -d app.env set -c API_TOKEN
 printf 'visible' | envdirx -d app.env set LOG_LEVEL
-envdirx -d app.env rekey --output app.env.new -k "$PWD/app.env.new.key"
-envdirx -d app.env.new run -- sh -c 'test "$API_TOKEN" = example-token && test "$LOG_LEVEL" = visible'
-envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token'
-mv app.env app.env.old
-mv app.env.new app.env
-envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token'
+envdirx -d app.env rekey -k "$PWD/app.env.new.key"
+envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token && test "$LOG_LEVEL" = visible'
+test "$(readlink app.env/.envdirx.key)" = "$PWD/app.env.new.key"
+! envdirx -d app.env get --key "$PWD/app.env.key" API_TOKEN 2>/dev/null
 ```
 
-Switch consumers only after verifying `DEST` as above, and back up the new key separately. The pointer in `DEST` is absolute, so renaming the envdir keeps it working. **Rotation does not revoke anything**: the old key still decrypts `SOURCE` and every backup or copy of its ciphertext. Delete them only once you no longer need them; if the old key or its ciphertext may have leaked, rotate the underlying service credentials as well, since `rekey` only re-encrypts the same values.
+Back up the new key separately. **Rotation does not revoke anything**: the old key still decrypts every backup or copy of the old ciphertext. Delete the old key only once you no longer need it; if the old key or its ciphertext may have leaked, rotate the underlying service credentials as well, since `rekey` only re-encrypts the same values.
 
 ## Migration from older CLI versions
 

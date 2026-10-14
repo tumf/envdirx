@@ -28,7 +28,7 @@ envdirx run -- sh -c 'test -n "$AAA" && test -n "$API_TOKEN"'
 | `envdirx get NAME` | 元のバイト列を標準出力へ。秘密は端末・ログへ出さない |
 | `envdirx encrypt NAME` / `envdirx encrypt --all` | 既存の平文をその場で暗号化 |
 | `envdirx decrypt NAME` / `envdirx decrypt --all` | 暗号文を**ディスク上の平文**に戻す |
-| `envdirx rekey --output DEST` | 新しい鍵で別の envdir へコピー。元の envdir は変更しない |
+| `envdirx rekey` | 暗号鍵をその場でローテーション。同じパスのまま新しい鍵で再暗号化する |
 | `envdirx run -- COMMAND [ARGS...]` | envdir を適用してコマンドを実行 |
 | `envdirx --version` / `envdirx -V` | envdir を読まずにインストール済みバージョンを表示 |
 
@@ -49,7 +49,7 @@ envdirx -d service.env run --key "$HOME/service.env.key" -- sh -c 'test "$API_TO
 - `envdirx [-d D ...] get [--key KEY] NAME`
 - `envdirx [-d D] encrypt (NAME [NAME ...] \| --all)`
 - `envdirx [-d D] decrypt [--key KEY] (NAME [NAME ...] \| --all)`
-- `envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
+- `envdirx [-d D] rekey [--key OLDKEY] [-k NEWKEYFILE \| -K NEWKEYDIR]`
 
 ## `set`: 平文が既定、暗号化は `-c`
 
@@ -156,32 +156,32 @@ envdirx -d service.env run -- true
 
 ## `rekey`: 鍵のローテーション
 
-`envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY] [-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]` は別の場所への書き出しで鍵を切り替える。新しい X25519 鍵を生成し、`DEST` に完全な新しい envdir を作る。`SOURCE`（省略時 `./.envs`）と旧鍵は変更も削除もせず、利用側の切り替えも行わない。
+`envdirx [-d DIR] rekey [--key OLDKEY] [-k/--new-key NEWKEYFILE | -K/--new-key-dir NEWKEYDIR]` は暗号鍵をその場でローテーションする。新しい X25519 鍵を生成し、暗号化エントリをすべて再暗号化して、`DIR`（省略時 `./.envs`）を同じパスのまま置き換える。利用側は同じ `-d DIR` を使い続ければよく、切り替え作業はない。旧鍵は変更も削除もしない。以前の別の場所へ書き出す形式 `rekey --output DEST` は削除した。`--output` を指定すると終了コード 2 で失敗し、何も書かない。
 
-- **`--key OLDKEY` は旧鍵を指す。新しい鍵を指す `keygen --key` とは意味が異なる。** `SOURCE` の復号だけに使い（省略時は `SOURCE/.envdirx.key`）、`SOURCE` に暗号化エントリがあるときだけ読む。`SOURCE/.envdirx.pub` は不要。
-- 新しい秘密鍵は `-k/--new-key NEWKEYFILE`、既存の `-K/--new-key-dir NEWKEYDIR` 内の `<sha256>.key`、どちらもなければ `keygen` と同じ既定の鍵ディレクトリへ書く。`SOURCE` と `DEST` のどちらの中にも置けず、既存ファイルは上書きしない（`-f` はない）。
-- `DEST` は存在してはならず（壊れたシンボリックリンクも不可）、親ディレクトリは既存でなければならない。シンボリックリンク経由の別名を含め、`SOURCE` の中にも、`SOURCE` を含む位置にも置けない。相対パスはカレントディレクトリ基準で、先頭の `~/` はホームへ展開する。
+- **`--key OLDKEY` は旧鍵を指す。新しい鍵を指す `keygen --key` とは意味が異なる。** `DIR` の復号だけに使い（省略時は `DIR/.envdirx.key`）、`DIR` に暗号化エントリがあるときだけ読む。`DIR/.envdirx.pub` は不要。
+- 新しい秘密鍵は `-k/--new-key NEWKEYFILE`、既存の `-K/--new-key-dir NEWKEYDIR` 内の `<sha256>.key`、どちらもなければ `keygen` と同じ既定の鍵ディレクトリへ書く。`DIR` の中には置けず、既存ファイルは上書きしない（`-f` はない）。相対パスはカレントディレクトリ基準で、先頭の `~/` はホームへ展開する。
 - 暗号化エントリ（新形式 `encrypted:B`、従来形式 `envdirx:v1:` のどちらも）はメモリ上で復号し、新しい鍵で新形式に再暗号化し、新しい秘密鍵で検証してから書き込む。予約済みプレフィックスで始まる値も暗号化したまま扱う。**復号した値をディスクに書いたり表示したりすることはない。**
-- **既存の平文エントリはそのままコピーし、平文のまま残る**（空の＝変数を削除するエントリも含む）。暗号化したいなら、その後 `DEST` に `encrypt` を実行する。
+- **既存の平文エントリはバイト列もモードもそのままコピーし、平文のまま残る**（空の＝変数を削除するエントリも含む）。暗号化したいなら、その後 `encrypt` を実行する。
 - 見えるエントリはすべて正しい名前の通常ファイルでなければならない。`.envdirx.pub`/`.envdirx.key` 以外のドットファイルがあれば拒否する。この2つはコピーせず、新しいメタデータに置き換える。
-- `DEST` は 0700、新しい `.envdirx.pub` は 0644、`.envdirx.key` は新しい鍵の絶対パスへのシンボリックリンク、エントリは 0600。`DEST` の隣の非公開ステージングディレクトリで組み立て、1回の rename で公開する。
+- `DIR` のパーミッションはそのまま保つ。再暗号化したエントリは 0600、新しい `.envdirx.pub` は 0644、`.envdirx.key` は新しい鍵の絶対パスへのシンボリックリンクになる。`-d` がシンボリックリンクなら、リンクは残したままリンク先をローテーションする。
+- `DIR` はファイルシステムのルートやマウントポイントであってはならず、カレントディレクトリを含んでいてもならない。親ディレクトリは書き込み可能でなければならない。ローテーション後の envdir は `DIR` の隣の非公開ステージングディレクトリ `.envdirx-rekey-*` で組み立て、1回の原子的なディレクトリ交換で `DIR` と入れ替える。macOS では `renamex_np`、Linux では libc の `renameat2` ラッパーと `RENAME_EXCHANGE` に対応したファイルシステムが必要。`rekey` は最初に空のプローブディレクトリ2つで交換を試し、使えなければ鍵を作る前に失敗する。原子的でない代替手段はない。
 
-検証・鍵・復号のエラーは、既定の鍵ディレクトリ・新しい鍵・ステージングディレクトリを作る前に検出する。処理できる失敗は終了コード 111 で、標準出力は空、エラーに値や鍵のバイト列は含まない。`DEST` には何も公開せず、今回作ったステージングディレクトリと新しい鍵だけを削除する（新しく作った空の既定鍵ディレクトリは残ることがある）。成功時は終了コード 0 で標準出力は空。プロセスの強制終了やクラッシュでは `.envdirx-rekey-*` ステージングディレクトリと新しい鍵が残ることがある（そのディレクトリには再暗号化したエントリと既存の平文エントリのコピーが含まれるが、復号した値は含まれない）。それでも `SOURCE` と旧鍵はそのまま使える。クラッシュに耐える原子的な永続性やメモリの安全な消去は保証しない。他の機能と同じく、別プロセスによるディレクトリの同時変更には対応しない。
+検証・鍵・復号のエラーは、既定の鍵ディレクトリ・新しい鍵・ステージングディレクトリを作る前に検出する。交換前の失敗は終了コード 111 で、標準出力は空、エラーに値や鍵のバイト列は含まない。`DIR` と旧鍵は変わらず、今回作ったステージングディレクトリと新しい鍵だけを削除する（新しく作った空の既定鍵ディレクトリは残ることがある）。交換がコミットポイントである。その後の処理（親ディレクトリの同期や以前の envdir の削除）が失敗した場合は `rotation completed` で始まるメッセージとともに終了コード 111 で終わる。このとき `DIR` はすでに新しい鍵を使っており、新しい鍵は残す。残ったディレクトリがあればメッセージに示す。成功時は終了コード 0 で標準出力は空、ステージングディレクトリは残らない。
+
+プロセスが強制終了されても、`DIR` が消えたり一部だけ置き換わったりすることはない。交換前なら `DIR` は元の envdir のままで、ステージングディレクトリと新しい鍵が残ることがある。交換後なら `DIR` はローテーション後の envdir で、以前の envdir が旧鍵を指したまま `.envdirx-rekey-*` として残ることがある。残ったディレクトリには暗号文と既存の平文エントリのコピーが含まれるが、復号した値は含まれない。**残った鍵やディレクトリを削除する前に、有効なポインタがどの鍵を指すかを確認する**（`readlink DIR/.envdirx.key`）。保証するのはプロセス中断に対する安全性だけで、電源断に耐える永続性、メモリの安全な消去、ACL・拡張属性・所有者・ディレクトリの inode の保持は保証しない。`DIR` に書き込むプロセスは先に止めること。他の機能と同じく、別プロセスによる同時変更には対応しない。カレントディレクトリや開いたディレクトリハンドルが `DIR` の中にあるプロセスは、以前の envdir を見続ける。交換の最中に読み込んでいるプロセスは失敗することがある（値を出力せずに安全側で失敗する）。交換後に起動したプロセスはローテーション後の envdir を読む。
 
 ```sh
 envdirx -d app.env mkdir
 envdirx -d app.env keygen -k "$PWD/app.env.key"
 printf 'example-token' | envdirx -d app.env set -c API_TOKEN
 printf 'visible' | envdirx -d app.env set LOG_LEVEL
-envdirx -d app.env rekey --output app.env.new -k "$PWD/app.env.new.key"
-envdirx -d app.env.new run -- sh -c 'test "$API_TOKEN" = example-token && test "$LOG_LEVEL" = visible'
-envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token'
-mv app.env app.env.old
-mv app.env.new app.env
-envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token'
+envdirx -d app.env rekey -k "$PWD/app.env.new.key"
+envdirx -d app.env run -- sh -c 'test "$API_TOKEN" = example-token && test "$LOG_LEVEL" = visible'
+test "$(readlink app.env/.envdirx.key)" = "$PWD/app.env.new.key"
+! envdirx -d app.env get --key "$PWD/app.env.key" API_TOKEN 2>/dev/null
 ```
 
-利用側の切り替えは、上のように `DEST` を確認してから行う。新しい鍵は別途バックアップする。`DEST` のポインタは絶対パスなので、envdir の名前を変えても有効なまま。**ローテーションは何も失効させない**: 旧鍵は `SOURCE` と、その暗号文のバックアップやコピーをすべて復号できる。不要になってから削除すること。旧鍵や暗号文が漏えいした可能性があるなら、`rekey` は同じ値を再暗号化するだけなので、元のサービスの認証情報も更新する。
+新しい鍵は別途バックアップする。**ローテーションは何も失効させない**: 旧鍵は以前の暗号文のバックアップやコピーをすべて復号できる。旧鍵は不要になってから削除すること。旧鍵や暗号文が漏えいした可能性があるなら、`rekey` は同じ値を再暗号化するだけなので、元のサービスの認証情報も更新する。
 
 ## `init` の廃止と移行
 
