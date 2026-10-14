@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import importlib.metadata
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -175,15 +176,15 @@ def _create(path: Path, data: bytes, mode: int) -> None:
         raise
 
 
-def _destination(key: Path, envdir: Path) -> Path:
-    """Return a fully resolved key destination outside ENVDIR whose parent exists."""
+def _destination(key: Path, *envdirs: Path) -> Path:
+    """Return a fully resolved key destination outside every ENVDIR whose parent exists."""
     if key.name in ("", ".", ".."):
         raise ValueError(f"invalid private key path: {key}")
     parent = key.parent.resolve(strict=True)
     if not parent.is_dir():
         raise ValueError(f"not a directory: {key.parent}")
     key = parent / key.name
-    if _inside(key, envdir):
+    if any(_inside(key, envdir) for envdir in envdirs):
         raise ValueError(f"private key must be outside the envdir: {key}")
     if os.path.lexists(key):
         raise ValueError(f"already exists; refusing to overwrite: {key}")
@@ -235,8 +236,8 @@ def _key_store(environ=os.environ) -> Path:
     return home / ".local" / "share" / "envdirx" / "keys"
 
 
-def _make_key_store(folder: Path, envdir: Path) -> Path:
-    """Validate FOLDER as outside ENVDIR, then create its missing directories at 0700; return it resolved.
+def _make_key_store(folder: Path, *envdirs: Path) -> Path:
+    """Validate FOLDER as outside every ENVDIR, then create its missing directories at 0700; return it resolved.
 
     The deepest existing path is resolved strictly (dangling or cyclic links fail),
     so symlink aliases of the envdir are rejected before anything is created.
@@ -256,7 +257,7 @@ def _make_key_store(folder: Path, envdir: Path) -> Path:
     if not resolved.is_dir():
         raise ValueError(f"not a directory: {existing}")
     target = resolved.joinpath(*reversed(missing))
-    if _inside(target, envdir):
+    if any(_inside(target, envdir) for envdir in envdirs):
         raise ValueError(f"default key directory must be outside the envdir: {target}")
     path = resolved
     for name in reversed(missing):
@@ -266,14 +267,13 @@ def _make_key_store(folder: Path, envdir: Path) -> Path:
     return target
 
 
-def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
-    """Write an external key (file or fingerprint-named), public key and absolute symlink pointer."""
-    envdir = directory.resolve(strict=True)
-    pub, pointer = directory / PUB, directory / POINTER
-    _refuse_existing(pub, pointer)
-    secret, public = _raw(X25519PrivateKey.generate())
+def _key_destination(key: str | None, key_dir: str | None, public: bytes, *envdirs: Path) -> Path:
+    """Select a new private-key path (-k file, -K directory or default store) outside every ENVDIR.
+
+    Only the default store may be created here, and only after it is validated.
+    """
     if key is None and key_dir is None:
-        folder = _make_key_store(_key_store(), envdir)
+        folder = _make_key_store(_key_store(), *envdirs)
         destination = folder / (hashlib.sha256(public).hexdigest() + ".key")
     elif key_dir is not None:
         folder = _home(key_dir)
@@ -283,7 +283,16 @@ def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
     else:
         destination = _home(key)
         _refuse_existing(destination)  # -k names a file, even when a directory already sits there
-    destination = _destination(destination, envdir)
+    return _destination(destination, *envdirs)
+
+
+def _keygen(directory: Path, key: str | None, key_dir: str | None) -> None:
+    """Write an external key (file or fingerprint-named), public key and absolute symlink pointer."""
+    envdir = directory.resolve(strict=True)
+    pub, pointer = directory / PUB, directory / POINTER
+    _refuse_existing(pub, pointer)
+    secret, public = _raw(X25519PrivateKey.generate())
+    destination = _key_destination(key, key_dir, public, envdir)
     _write_all((
         (destination, lambda path: _create(path, secret, 0o600)),
         (pub, lambda path: _create(path, public, 0o644)),
@@ -389,6 +398,82 @@ def _transform(directory: Path, names: list[str], decrypt: bool, key: str | None
         _atomic(path, data, 0o600)
 
 
+def _output(text: str, envdir: Path) -> Path:
+    """Return the absent rekey destination under its resolved existing parent, not overlapping ENVDIR."""
+    path = _home(text)
+    if os.path.basename(text) in ("", ".", "..") or path.name in ("", ".", ".."):
+        raise ValueError(f"invalid output directory: {text}")
+    _refuse_existing(path)
+    try:
+        parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot resolve output parent {path.parent}: {getattr(exc, 'strerror', None) or exc}") from None
+    if not parent.is_dir():
+        raise ValueError(f"not a directory: {path.parent}")
+    output = parent / path.name
+    _refuse_existing(output)
+    if _inside(output, envdir) or _inside(envdir, output):
+        raise ValueError(f"output directory must not overlap the source envdir: {output}")
+    return output
+
+
+def _rekey(directory: Path, output: str, key: str | None, new_key: str | None, new_key_dir: str | None) -> None:
+    """Write a complete new envdir at OUTPUT under a fresh external key; DIRECTORY and its key stay untouched.
+
+    Everything is validated, decrypted, re-encrypted and verified in memory
+    before the first write (a missing default key store may then be created).
+    The new envdir is staged in a private sibling directory and published by a
+    single rename; a handled failure removes the staging directory and the new
+    key. Decrypted values never reach the disk: only ciphertext is staged.
+    """
+    envdir = directory.resolve(strict=True)
+    destination = _output(output, envdir)
+    entries = []
+    for path in sorted(directory.iterdir()):
+        if path.name in (PUB, POINTER):
+            continue  # replaced by new metadata, never copied
+        if path.name.startswith("."):
+            raise ValueError(f"unexpected metadata file: {path}")
+        _name(path.name)
+        _regular(path)
+        data = path.read_bytes()
+        if not data.startswith((MAGIC, LEGACY_MAGIC)) and _reserved(data):
+            raise ValueError(f"unsupported ciphertext format: {path.name}")
+        entries.append((path.name, data, data.startswith((MAGIC, LEGACY_MAGIC))))
+    if any(encrypted for _, _, encrypted in entries):
+        old = _private(directory, key)  # resolved only when ciphertext exists
+        entries = [(name, _decrypt(data, name, old) if encrypted else data, encrypted) for name, data, encrypted in entries]
+    private = X25519PrivateKey.generate()
+    secret, public = _raw(private)
+    prepared = []
+    for name, data, encrypted in entries:
+        if encrypted:
+            ciphertext = _encrypt(data, name, private.public_key())
+            if _decrypt(ciphertext, name, private) != data:
+                raise ValueError(f"re-encryption verification failed: {name}")
+            data = ciphertext
+        prepared.append((name, data))  # plaintext entries are copied unchanged
+    del entries
+    key_path = _key_destination(new_key, new_key_dir, public, envdir, destination)
+    staging = None
+    _create(key_path, secret, 0o600)
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=".envdirx-rekey-", dir=destination.parent))
+        os.chmod(staging, 0o700)  # umask must not loosen or tighten the new envdir
+        _create(staging / PUB, public, 0o644)
+        _link(staging / POINTER, key_path)
+        for name, data in prepared:
+            _create(staging / name, data, 0o600)
+        # rename(2) would replace an empty directory; refuse anything that appeared meanwhile.
+        _refuse_existing(destination)
+        os.rename(staging, destination)
+    except BaseException:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        key_path.unlink(missing_ok=True)  # _create's O_EXCL guarantees this invocation created it
+        raise
+
+
 def _run(directory: Path, key: str | None, command: list[str]) -> None:
     env = os.environ.copy()
     keys = []
@@ -421,6 +506,8 @@ global too: it prints the installed version and reads no envdir.
   envdirx [-d DIR ...] get [--key KEY] NAME
   envdirx [-d DIR] encrypt (NAME [NAME ...] | --all)
   envdirx [-d DIR] decrypt [--key KEY] (NAME [NAME ...] | --all)
+  envdirx [-d SOURCE] rekey --output DEST [--key OLDKEY]
+                            [-k NEWKEYFILE | -K NEWKEYDIR]
   envdirx [-d DIR] run [--key KEY] -- COMMAND [ARGS...]"""
 
 KEY_HELP = """\
@@ -497,6 +584,36 @@ Only this default directory is created when missing (mode 0700); existing
 directories keep their modes. Reading never consults it: get, run and
 decrypt use DIRECTORY/.envdirx.key or --key."""
 
+REKEY_HELP = """\
+Rotates to a fresh X25519 key out of place: writes a complete new envdir at
+DEST and a new private key, and never changes or deletes SOURCE (-d, default
+./.envs) or its old key. DEST must not exist (not even as a dangling symlink),
+its parent must already exist, and it must not overlap SOURCE.
+
+Unlike keygen, --key OLDKEY names the OLD private key used only to decrypt
+SOURCE (default: SOURCE/.envdirx.key); it is read only when SOURCE holds
+encrypted entries. The NEW private key goes to -k/--new-key NEWKEYFILE, to
+the existing -K/--new-key-dir NEWKEYDIR as <sha256 of public key>.key, or by
+default to the keygen key directory ($XDG_DATA_HOME/envdirx/keys, else
+$HOME/.local/share/envdirx/keys, created mode 0700 when missing). It must lie
+outside SOURCE and DEST and is never overwritten (no force option). Relative
+paths use the current directory and a leading ~/ expands.
+
+Encrypted entries, printable or legacy binary, are decrypted in memory,
+re-encrypted for the new key in the printable format and verified before
+anything is written; decrypted values are never written to disk. Plaintext
+entries are copied unchanged and stay plaintext. Dotfiles other than
+.envdirx.pub/.envdirx.key are refused; those two are replaced, not copied.
+DEST gets a new .envdirx.pub (0644), an absolute .envdirx.key symlink, mode
+0700 and entries 0600. It is staged in a private sibling directory and
+published by one rename; on failure nothing is published and the new key and
+staging directory are removed. An interrupted run may leave a staging
+directory and new key behind, but SOURCE and the old key remain usable.
+
+Nothing is switched over: verify DEST, then point consumers at it yourself.
+The old key still decrypts SOURCE and any copies of it; if a key leaked,
+rotate the underlying service credentials too."""
+
 def main() -> None:
     text = argparse.RawDescriptionHelpFormatter
     parser = argparse.ArgumentParser(prog="envdirx", description=DESCRIPTION, formatter_class=text)
@@ -509,6 +626,7 @@ def main() -> None:
     get = sub.add_parser("get", help="print one entry's raw value", description=GET_HELP, formatter_class=text)
     encrypt = sub.add_parser("encrypt", help="encrypt plaintext entries in place (public key only)", usage="%(prog)s (NAME [NAME ...] | --all)", description=ENCRYPT_HELP, formatter_class=text)
     decrypt = sub.add_parser("decrypt", help="decrypt entries in place to plaintext on disk", usage="%(prog)s [--key KEY] (NAME [NAME ...] | --all)", description=DECRYPT_HELP, formatter_class=text)
+    rekey = sub.add_parser("rekey", help="copy the envdir to a new directory under a fresh key", usage="%(prog)s --output DEST [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]", description=REKEY_HELP, formatter_class=text)
     run = sub.add_parser("run", help="run command with envdir entries", description=RUN_HELP, formatter_class=text)
     destination = keygen.add_mutually_exclusive_group()
     destination.add_argument("-k", "--key", help="private key file to create outside the envdir")
@@ -521,6 +639,11 @@ def main() -> None:
         transform.add_argument("--all", action="store_true", help=f"{verb} every visible entry that needs it")
         transform.add_argument("names", nargs="*", metavar="NAME", help=f"entry to {verb}")
     decrypt.add_argument("--key", help="private key to use instead of .envdirx.key")
+    rekey.add_argument("--output", required=True, metavar="DEST", help="new envdir to create; must not exist")
+    rekey.add_argument("--key", metavar="OLDKEY", help="OLD private key for decrypting SOURCE instead of SOURCE/.envdirx.key")
+    new_key = rekey.add_mutually_exclusive_group()
+    new_key.add_argument("-k", "--new-key", metavar="NEWKEYFILE", help="NEW private key file to create outside SOURCE and DEST")
+    new_key.add_argument("-K", "--new-key-dir", metavar="NEWKEYDIR", help="existing directory for the NEW <sha256>.key (default: created XDG data directory envdirx/keys)")
     run.add_argument("--key", help="private key to use instead of .envdirx.key; must precede --")
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
     args = parser.parse_args()
@@ -551,6 +674,8 @@ def main() -> None:
             _keygen(directory, args.key, args.key_dir)
         elif args.action in ("encrypt", "decrypt"):
             _transform(directory, args.names, args.action == "decrypt", getattr(args, "key", None))
+        elif args.action == "rekey":
+            _rekey(directory, args.output, args.key, args.new_key, args.new_key_dir)
         elif args.action == "set":
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
         else:

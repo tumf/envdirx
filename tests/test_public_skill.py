@@ -13,6 +13,8 @@ class PublicSkillTest(unittest.TestCase):
         self.assertIn("set -c", text)
         self.assertIn("~/.local/share/envdirx/keys", text)
         self.assertIn("XDG_DATA_HOME", text)
+        self.assertIn("rekey --output DEST [--key OLDKEY] [-k/--new-key FILE | -K/--new-key-dir DIR]", text)
+        self.assertIn("verify DEST before cutover", text)
         self.assertNotIn("/Users/", text)
         self.assertNotIn(".agents/", text)
 
