@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextlib
 import ctypes
+import fcntl
 import hashlib
 import importlib.metadata
 import os
@@ -588,6 +589,32 @@ def _rekey(directory: Path, key: str | None, new_key: str | None, new_key_dir: s
                          f"the previous envdir may remain at {staging}") from None
 
 
+BUSY = "envdir is busy: another envdirx writer holds the parent directory lock; retry after it finishes"
+
+
+@contextlib.contextmanager
+def _writer_lock(directory: Path):
+    """Hold an exclusive nonblocking flock on DIRECTORY's real parent; yield the resolved envdir.
+
+    ponytail: one cooperative lock per local parent directory, so sibling
+    envdirs contend; finer granularity can be added when needed. The parent
+    inode, unlike the envdir inode that rekey exchanges, is stable across
+    publication. No lock file is created, and the OS releases the lock when
+    the process dies. flock (not lockf) because _retire closes another FD on
+    the same parent, which would drop a POSIX record lock.
+    """
+    envdir = directory.resolve(strict=True)
+    fd = os.open(envdir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)  # non-inheritable
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(BUSY) from None
+        yield envdir
+    finally:
+        os.close(fd)
+
+
 def _run(directory: Path, key: str | None, command: list[str]) -> None:
     env = os.environ.copy()
     keys = []
@@ -612,6 +639,12 @@ Store DJB envdir entries as plaintext or encrypted files and run commands with
 them. -d/--directory goes BEFORE the subcommand and defaults to ./.envs
 relative to the current directory; only mkdir creates it. -V/--version is
 global too: it prints the installed version and reads no envdir.
+
+Writers (keygen, set, encrypt, decrypt, rekey) hold an exclusive lock on
+DIR's parent directory for the whole command, so they need read and search
+permission on it. Another writer under the same parent exits 111 with
+"envdir is busy"; retry after it finishes. get, run and mkdir take no lock.
+Only upgraded envdirx writers cooperate: stop older versions and editors.
 
   envdirx (-V | --version)
   envdirx [-d DIR] mkdir
@@ -710,7 +743,7 @@ automatically; no keygen step is needed. The old key is never deleted.
 Directories and keys:
   DIR: -d DIR before rekey (default: ./.envs); symlink aliases stay intact.
     DIR must not be a filesystem root or mountpoint, must not contain the
-    current directory, and its parent must be writable.
+    current directory, and its parent must be readable and writable.
   OLD key: --key OLDKEY overrides DIR/.envdirx.key for decryption.
     Unlike keygen, --key selects an existing OLD key; it never creates one.
     The old key is read only when DIR contains encrypted entries.
@@ -734,9 +767,11 @@ Safety:
   DIR and the old key are unchanged and the new key is removed; after it, the
   new key is kept even if cleanup fails. A killed run may leave a
   .envdirx-rekey-* directory or a new key behind: check which key
-  DIR/.envdirx.key points to before deleting anything. Processes reading DIR
-  during the exchange may fail; stop writers first. The old key still decrypts
-  old copies of DIR. If a key leaked, rotate the underlying service
+  DIR/.envdirx.key points to before deleting anything; a killed run never
+  leaves a stale lock. Other envdirx writers under DIR's parent exit 111 as
+  busy until rekey ends; stop older envdirx versions and other writers first.
+  Processes reading DIR during the exchange may fail. The old key still
+  decrypts old copies of DIR. If a key leaked, rotate the underlying service
   credentials too."""
 
 def main() -> None:
@@ -799,18 +834,21 @@ def main() -> None:
             return
         if not directory.is_dir():
             raise ValueError(f"not a directory: {directory}")
-        if args.action == "keygen":
-            _keygen(directory, args.key, args.key_dir)
-        elif args.action in ("encrypt", "decrypt"):
-            _transform(directory, args.names, args.action == "decrypt", getattr(args, "key", None))
-        elif args.action == "rekey":
-            _rekey(directory, args.key, args.new_key, args.new_key_dir)
-        elif args.action == "set":
-            if sys.stdin is None:
-                raise ValueError("stdin is closed; set reads the value from stdin")
-            _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
-        else:
+        if args.action == "run":
             _run(directory, args.key, args.command[1:])
+            return
+        if args.action == "set" and sys.stdin is None:
+            raise ValueError("stdin is closed; set reads the value from stdin")
+        # Every writer holds the lock from before its first read through cleanup.
+        with _writer_lock(directory) as envdir:
+            if args.action == "keygen":
+                _keygen(envdir, args.key, args.key_dir)
+            elif args.action in ("encrypt", "decrypt"):
+                _transform(envdir, args.names, args.action == "decrypt", getattr(args, "key", None))
+            elif args.action == "rekey":
+                _rekey(envdir, args.key, args.new_key, args.new_key_dir)
+            else:
+                _set(envdir, args.name, sys.stdin.buffer.read(), args.encrypt)
     except KeyboardInterrupt:
         parser.exit(130)
     except BrokenPipeError as exc:
