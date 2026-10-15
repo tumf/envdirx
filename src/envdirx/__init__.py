@@ -788,6 +788,8 @@ def main() -> None:
             transform.error("duplicate entry name")
     try:
         if args.action == "get":
+            if sys.stdout is None:
+                raise ValueError("stdout is closed; get writes the value to stdout")
             value = _get_first(directories, args.key, args.name)
             sys.stdout.buffer.write(value)
             sys.stdout.buffer.flush()
@@ -804,11 +806,18 @@ def main() -> None:
         elif args.action == "rekey":
             _rekey(directory, args.key, args.new_key, args.new_key_dir)
         elif args.action == "set":
+            if sys.stdin is None:
+                raise ValueError("stdin is closed; set reads the value from stdin")
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
         else:
             _run(directory, args.key, args.command[1:])
     except KeyboardInterrupt:
         parser.exit(130)
+    except BrokenPipeError as exc:
+        # The unflushed stdout buffer would fail again at interpreter exit
+        # (status 120 plus "Exception ignored"); let that retry hit /dev/null.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        parser.exit(111, f"envdirx: {exc}\n")
     except (OSError, ValueError) as exc:
         parser.exit(111, f"envdirx: {exc}\n")
 

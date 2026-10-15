@@ -35,6 +35,17 @@ While `set` or `set -c` reads stdin, Ctrl-C SHALL exit 130 without a traceback o
 - **WHEN** stdin reading is interrupted before EOF
 - **THEN** the command exits 130, writes no entry, and emits no traceback
 
+### Requirement: Closed or broken standard streams
+When `set` runs with a closed stdin, or `get` runs with a closed stdout, the command SHALL exit 111 with an `envdirx:` diagnostic and no traceback, writing no entry. When `get` hits a broken stdout pipe, it SHALL exit 111 with the `envdirx:` diagnostic only; the interpreter's exit-time stdout flush SHALL NOT turn that into status 120 or an "Exception ignored" message.
+
+#### Scenario: Closed streams
+- **WHEN** `set NAME <&-` or `get NAME >&-` runs
+- **THEN** exit is 111, stderr holds one `envdirx:` line, no entry is written and no traceback appears
+
+#### Scenario: Reader gone before get writes
+- **WHEN** get writes to a pipe whose reader has already exited
+- **THEN** exit is 111 and stderr holds only the broken-pipe diagnostic
+
 ### Requirement: Safe external key generation
 Keygen SHALL accept mutually exclusive optional -k/--key filename or -K/--key-dir existing directory, no force flag, no overwrite. When neither destination is specified, it SHALL use nonempty absolute XDG_DATA_HOME plus envdirx/keys, otherwise HOME/.local/share/envdirx/keys; unset, empty and relative XDG_DATA_HOME SHALL use the HOME fallback. Literal ~ in XDG_DATA_HOME SHALL NOT be expanded. Only this implicit default SHALL lazily create missing directories at 0700 regardless of umask, leaving existing modes unchanged. Explicit -K SHALL require an existing directory. The implicit resolved destination SHALL be validated as outside resolved envdir before directory creation, including symlink aliases and descendants; missing envdir, existing public/pointer, invalid path, non-directory, dangling/cyclic links and filesystem errors SHALL fail 111 without new key/public/pointer artifacts. Existing data SHALL remain unchanged. Newly created empty default directories MAY remain after a subsequent key write failure. Directory destinations SHALL name the key SHA256(raw public key) as full lowercase hex plus .key. Keygen SHALL write external private key 0600, regular public key 0644 and absolute-target .envdirx.key symlink, preflight all collisions including dangling links, reject resolved in-envdir key destinations and cleanup only newly created key/public/pointer artifacts on failure. Explicit -k/-K SHALL ignore the default location, and reads SHALL continue to require the selected envdir pointer or --key without scanning or migrating the key store.
 

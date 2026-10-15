@@ -129,6 +129,20 @@ class EnvdirxTest(unittest.TestCase):
                 self.assertEqual(stderr.getvalue(), "")
                 self.assertFalse((fx.directory / "TOKEN").exists())
 
+    def test_set_closed_stdin_exits_111_without_traceback(self):
+        """Python sets sys.stdin to None when fd 0 is closed (set NAME <&-)."""
+        fx = Fixture(self)
+        for flags in ((), ("-c",)):
+            with self.subTest(flags=flags):
+                argv = ["envdirx", "-d", str(fx.directory), "set", *flags, "TOKEN"]
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdin", None), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exited:
+                        envdirx.main()
+                self.assertEqual(exited.exception.code, 111)
+                self.assertEqual(stderr.getvalue(), "envdirx: stdin is closed; set reads the value from stdin\n")
+                self.assertFalse((fx.directory / "TOKEN").exists())
+
     def test_get_searches_directories_in_order(self):
         fx = Fixture(self)
         second = fx.root / "second"
@@ -1229,6 +1243,31 @@ class GetFailureTest(unittest.TestCase):
         with mock.patch.object(envdirx.os, "geteuid", return_value=os.geteuid() + 1):
             with self.assertRaisesRegex(ValueError, "owned by the current user"):
                 envdirx._get(fx.directory, str(key), "TOKEN")
+
+    def test_closed_stdout_exits_111_without_traceback(self):
+        """Python sets sys.stdout to None when fd 1 is closed (get NAME >&-)."""
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        argv = ["envdirx", "-d", str(fx.directory), "get", "TOKEN"]
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdout", None), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as exited:
+                envdirx.main()
+        self.assertEqual(exited.exception.code, 111)
+        self.assertEqual(stderr.getvalue(), "envdirx: stdout is closed; get writes the value to stdout\n")
+
+    def test_broken_pipe_exits_111_without_shutdown_error(self):
+        """A reader that is already gone must not turn exit 111 into Python's status 120 flush failure."""
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        reader, writer = os.pipe()
+        os.close(reader)  # no reader exists before the child starts: every write gets EPIPE
+        try:
+            result = subprocess.run([*CLI, "-d", str(fx.directory), "get", "TOKEN"], env=fx.env, cwd=fx.root, stdout=writer, stderr=subprocess.PIPE, timeout=30)
+        finally:
+            os.close(writer)
+        self.assertEqual(result.returncode, 111, result.stderr)
+        self.assertEqual(result.stderr, b"envdirx: [Errno 32] Broken pipe\n")
 
     def test_key_override_agrees_with_run(self):
         fx = Fixture(self)
