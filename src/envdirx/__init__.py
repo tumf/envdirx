@@ -807,6 +807,8 @@ def main() -> None:
             _set(directory, args.name, sys.stdin.buffer.read(), args.encrypt)
         else:
             _run(directory, args.key, args.command[1:])
+    except KeyboardInterrupt:
+        parser.exit(130)
     except (OSError, ValueError) as exc:
         parser.exit(111, f"envdirx: {exc}\n")
 

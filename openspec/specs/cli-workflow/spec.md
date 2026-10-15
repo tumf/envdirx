@@ -28,6 +28,13 @@ Get SHALL accept repeated global `-d/--directory` options before the subcommand 
 - **WHEN** get searches two envdirs and the first has no named entry
 - **THEN** it returns the second entry's original bytes; if the first has an empty entry it returns zero bytes instead, and if the first has a malformed entry it fails without consulting the second
 
+### Requirement: Clean input interruption
+While `set` or `set -c` reads stdin, Ctrl-C SHALL exit 130 without a traceback or writing the entry.
+
+#### Scenario: Cancel entry input
+- **WHEN** stdin reading is interrupted before EOF
+- **THEN** the command exits 130, writes no entry, and emits no traceback
+
 ### Requirement: Safe external key generation
 Keygen SHALL accept mutually exclusive optional -k/--key filename or -K/--key-dir existing directory, no force flag, no overwrite. When neither destination is specified, it SHALL use nonempty absolute XDG_DATA_HOME plus envdirx/keys, otherwise HOME/.local/share/envdirx/keys; unset, empty and relative XDG_DATA_HOME SHALL use the HOME fallback. Literal ~ in XDG_DATA_HOME SHALL NOT be expanded. Only this implicit default SHALL lazily create missing directories at 0700 regardless of umask, leaving existing modes unchanged. Explicit -K SHALL require an existing directory. The implicit resolved destination SHALL be validated as outside resolved envdir before directory creation, including symlink aliases and descendants; missing envdir, existing public/pointer, invalid path, non-directory, dangling/cyclic links and filesystem errors SHALL fail 111 without new key/public/pointer artifacts. Existing data SHALL remain unchanged. Newly created empty default directories MAY remain after a subsequent key write failure. Directory destinations SHALL name the key SHA256(raw public key) as full lowercase hex plus .key. Keygen SHALL write external private key 0600, regular public key 0644 and absolute-target .envdirx.key symlink, preflight all collisions including dangling links, reject resolved in-envdir key destinations and cleanup only newly created key/public/pointer artifacts on failure. Explicit -k/-K SHALL ignore the default location, and reads SHALL continue to require the selected envdir pointer or --key without scanning or migrating the key store.
 

@@ -114,6 +114,21 @@ class Fixture:
 
 
 class EnvdirxTest(unittest.TestCase):
+    def test_set_interrupt_does_not_write_or_traceback(self):
+        fx = Fixture(self)
+        for flags in ((), ("-c",)):
+            with self.subTest(flags=flags):
+                argv = ["envdirx", "-d", str(fx.directory), "set", *flags, "TOKEN"]
+                stdin = mock.Mock()
+                stdin.buffer.read.side_effect = KeyboardInterrupt
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exited:
+                        envdirx.main()
+                self.assertEqual(exited.exception.code, 130)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertFalse((fx.directory / "TOKEN").exists())
+
     def test_get_searches_directories_in_order(self):
         fx = Fixture(self)
         second = fx.root / "second"
