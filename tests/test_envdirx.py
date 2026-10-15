@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -543,8 +544,12 @@ class EnvdirxTest(unittest.TestCase):
         self.assertIn(b"usage: envdirx rekey [--key OLDKEY] [-k NEWKEYFILE | -K NEWKEYDIR]\n\nExamples:\n  envdirx rekey\n", rekey_help)
         for text in (b"rotates the encryption key of DIR in place", b"envdirx -d ./app.env rekey -k", b"DIR: -d DIR", b"symlink aliases stay intact", b"mountpoint", b"OLD key: --key OLDKEY", b"NEW key: -k/--new-key", b"-k, --new-key NEWKEYFILE", b"-K, --new-key-dir NEWKEYDIR", b"legacy", b"never written to disk", b"stay plaintext", b"atomic directory exchange", b"renamex_np", b"renameat2", b"DIR/.envdirx.key points to", b"rotate the underlying service\n  credentials"):
             self.assertIn(text, rekey_help)
-        for text in (b"--output", b"DEST", b"SOURCE", b"one rename", b"point consumers"):
+        for text in (b"--output", b"DEST", b"SOURCE", b"one rename", b"point consumers", b"stop writers first"):
             self.assertNotIn(text, rekey_help)
+        for text in (b"exit 111 as\n  busy until rekey ends", b"never\n  leaves a stale lock", b"stop older envdirx versions", b"readable and writable"):
+            self.assertIn(text, rekey_help)
+        for text in (b"Writers (keygen, set, encrypt, decrypt, rekey) hold an exclusive lock on\nDIR's parent directory", b"read and search\npermission", b'"envdir is busy"; retry after it finishes', b"get, run and mkdir take no lock", b"stop older versions"):
+            self.assertIn(text, main_help)
         run_help = fx.call("run", "--help").stdout
         self.assertIn(b"must precede it", run_help)
         self.assertIn(b".envdirx.key", run_help)
@@ -602,6 +607,14 @@ class EnvdirxTest(unittest.TestCase):
         for text in ("その場でローテーション", "切り替え作業はない", "旧鍵を指す", "平文のまま残る", "ディスクに書いたり表示したりすることはない", "認証情報も更新する", "消えたり一部だけ置き換わったりすることはない", "電源断", "交換の最中に読み込んでいるプロセスは失敗することがある", "以前の envdir を見続ける", "原子的でない代替手段はない"):
             self.assertIn(text, readme_ja)
         self.assertIn("Its `--key` is the OLD key", skill)
+        for text in ("exclusive nonblocking `flock` on the envdir's parent directory", "`envdir is busy`", "read/search permission", "No lock file", "stop older versions"):
+            self.assertIn(text, skill)
+        for text in ("## Concurrent writers", "exclusive, nonblocking `flock` on the **parent directory**", "`envdir is busy: ... retry after it finishes`", "sibling envdirs in the same parent directory also block each other", "No lock file is created", "`SIGKILL`", "read and search permission on the parent directory", "0711 or 0311", "instead of running unlocked", "resolved envdir path", "Only upgraded envdirx writers cooperate", "some NFS setups", "not a power-loss guarantee", "[Concurrent writers](#concurrent-writers)", "readable and writable"):
+            self.assertIn(text, readme)
+        self.assertNotIn("it does not defend against concurrent changes by another process", readme)
+        for text in ("## 書き込みコマンドの排他", "**親ディレクトリ**に排他的な非ブロッキング `flock`", "`envdir is busy: ... retry after it finishes`", "兄弟の envdir どうしも互いに拒否し合う", "ロックファイルは作らない", "`SIGKILL`", "読み取り・検索権限", "0711 や 0311", "ロックなしで続行せずに", "解決済みの envdir パス", "新しいバージョンの envdirx の書き込みコマンドだけ", "一部の NFS 構成", "電源断に対する保証でもない", "[書き込みコマンドの排他](#書き込みコマンドの排他)", "読み取り・書き込み可能"):
+            self.assertIn(text, readme_ja)
+        self.assertNotIn("別プロセスによる同時変更には対応しない", readme_ja)
         self.assertNotIn("ciphertext only", readme)
         self.assertNotIn("暗号文のみ", readme_ja)
         self.assertIn("staged copies of existing plaintext entries", readme)
@@ -2194,6 +2207,490 @@ class RekeyTest(unittest.TestCase):
                 else:
                     self.assertEqual({name: (fx.directory / name).read_bytes() for name in self.encrypted}, self.old_ciphertext)
                 self.assert_clean(fx, result)
+
+
+WRITER_CHILD = r"""
+import contextlib, errno, fcntl, json, os, sys
+from pathlib import Path
+import envdirx
+ack, go = int(sys.argv[1]), int(sys.argv[2])
+config = json.loads(sys.argv[3])
+boundary, phase, target = config["boundary"], config["phase"], config.get("target")
+if config.get("disable_flock"):
+    fcntl.flock = lambda fd, operation: None  # causal control: the barrier alone must not exclude
+
+
+def pause(wait=True):
+    os.write(ack, b"R")
+    if not wait:
+        return
+    command = os.read(go, 1)
+    if command == b"I":
+        raise KeyboardInterrupt
+    if command == b"E":
+        raise OSError(errno.EIO, "Input/output error")
+    if command != b"G":
+        os._exit(99)  # the test went away: never continue unsupervised
+
+
+real = getattr(envdirx, boundary)
+if boundary == "_writer_lock":
+    @contextlib.contextmanager
+    def wrapper(directory):
+        with real(directory) as envdir:
+            pause(wait=False)  # admitted; set then blocks reading the test-controlled stdin
+            yield envdir
+else:
+    def wrapper(*args, **kwargs):
+        hit = target is None or Path(args[0]) == Path(target)
+        if hit and phase == "before":
+            pause()
+        result = real(*args, **kwargs)
+        if hit and phase == "after":
+            pause()
+        return result
+setattr(envdirx, boundary, wrapper)
+sys.argv = ["envdirx", *sys.argv[4:]]
+envdirx.main()
+"""
+
+
+class Holder:
+    """A real CLI process paused at a pipe barrier inside one private boundary while it holds the writer lock."""
+
+    def __init__(self, test, fx, boundary, phase, *args, target=None, disable_flock=False, stdin=subprocess.DEVNULL, input=None):
+        self.test = test
+        ack_r, ack_w = os.pipe()
+        go_r, go_w = os.pipe()
+        config = json.dumps({"boundary": boundary, "phase": phase, "target": str(target) if target else None, "disable_flock": disable_flock})
+        self.proc = subprocess.Popen([sys.executable, "-c", WRITER_CHILD, str(ack_w), str(go_r), config, *map(str, args)],
+                                     env=fx.env, cwd=fx.root, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(ack_w, go_r))
+        os.close(ack_w)
+        os.close(go_r)
+        if input is not None:  # the whole value, so set reaches its boundary
+            self.proc.stdin.write(input)
+            self.proc.stdin.close()
+            self.proc.stdin = None
+        self.ack, self.go = ack_r, go_w
+        test.addCleanup(self.cleanup)
+
+    def ready(self):
+        """Wait (bounded) until the child reports it reached the barrier; a dead child or timeout fails."""
+        readable, _, _ = select.select([self.ack], [], [], 30)
+        self.test.assertTrue(readable, "barrier timeout")
+        self.test.assertEqual(os.read(self.ack, 1), b"R", "the child exited before the barrier")
+        return self
+
+    def resume(self, command=b"G", input=None):
+        if command:
+            os.write(self.go, command)
+        return self.finish(input)
+
+    def signal(self, number):
+        self.proc.send_signal(number)
+        return self.finish()
+
+    def finish(self, input=None):
+        stdout, stderr = self.proc.communicate(input=input, timeout=30)
+        return subprocess.CompletedProcess(self.proc.args, self.proc.returncode, stdout, stderr)
+
+    def cleanup(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.communicate(timeout=30)
+        for fd in (self.ack, self.go):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+class WriterLockTest(unittest.TestCase):
+    """Cooperating writers exclude each other through one flock on the envdir's parent, including across rekey's exchange."""
+
+    def fixture(self, keyed=True):
+        fx = Fixture(self)
+        fx.env["XDG_DATA_HOME"] = str(fx.root / "xdg")  # synthetic store inside the snapshot
+        if keyed:
+            fx.keygen_encrypted()
+            (fx.directory / "PLAIN").write_bytes(b"plain-value\n")
+            fx.old_key_bytes = (fx.root / "service.key").read_bytes()
+        return fx
+
+    def assert_busy(self, fx, result, before):
+        self.assertEqual(result.returncode, 111, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, f"envdirx: {envdirx.BUSY}\n".encode())
+        self.assertEqual(fx.snapshot(), before, "a refused writer changes nothing")
+
+    def assert_ok(self, result):
+        self.assertEqual((result.returncode, result.stdout), (0, b""), result.stderr)
+
+    def assert_get(self, fx, name, value, directory=None):
+        result = fx.on("get", name, directory=directory)
+        self.assertEqual((result.returncode, result.stdout), (0, value), result.stderr)
+
+    def rekey_holder(self, fx, boundary, phase, *args):
+        return Holder(self, fx, boundary, phase, "-d", fx.directory, "rekey", "-k", fx.root / "new.key", *args, target=fx.directory).ready()
+
+    def parent_alias(self, fx):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        link = Path(tmp.name) / "parent"
+        link.symlink_to(fx.root)
+        return link / fx.directory.name
+
+    def contenders(self, fx):
+        """Every writer family, the rekey through direct/relative/envdir-alias/parent-alias paths."""
+        alias = fx.root / "service-link"
+        if not alias.is_symlink():
+            alias.symlink_to(fx.directory)
+        return {
+            "rekey": (["-d", fx.directory, "rekey"], None),
+            "rekey relative": (["-d", fx.directory.name, "rekey"], None),
+            "rekey envdir alias": (["-d", alias, "rekey", "-k", fx.root / "other.key"], None),
+            "rekey parent alias": (["-d", self.parent_alias(fx), "rekey"], None),
+            "set new": (["-d", fx.directory, "set", "NEW"], b"new\n"),
+            "set update": (["-d", alias, "set", "PLAIN"], b"updated\n"),
+            "set -c": (["-d", fx.directory, "set", "-c", "SECRET2"], b"s2\n"),
+            "encrypt --all": (["-d", fx.directory, "encrypt", "--all"], None),
+            "decrypt --all": (["-d", fx.directory, "decrypt", "--all"], None),
+            "keygen": (["-d", fx.directory, "keygen", "-k", fx.root / "k2.key"], None),
+        }
+
+    def test_paused_rekey_refuses_every_writer_then_retries_succeed(self):
+        for phase in ("before", "after"):
+            with self.subTest(phase=phase):
+                fx = self.fixture()
+                contenders = self.contenders(fx)
+                holder = self.rekey_holder(fx, "_exchange", phase)
+                before = fx.snapshot()
+                for label, (args, input) in contenders.items():
+                    with self.subTest(label):
+                        self.assert_busy(fx, fx.call(*args, input=input), before)
+                self.assert_ok(holder.resume())
+                key = fx.root / "new.key"
+                self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(key))
+                self.assert_ok(fx.on("set", "NEW", input=b"new\n"))
+                self.assert_ok(fx.on("set", "PLAIN", input=b"updated\n"))
+                self.assert_ok(fx.on("set", "-c", "SECRET2", input=b"s2\n"))
+                self.assert_get(fx, "NEW", b"new\n")
+                self.assert_get(fx, "PLAIN", b"updated\n")
+                self.assert_get(fx, "SECRET2", b"s2\n")  # encrypted under the new public key
+                self.assert_get(fx, "TOKEN", SECRET + b"\n")
+                self.assertEqual(fx.on("get", "--key", fx.root / "service.key", "SECRET2").returncode, 111)
+                self.assertEqual((fx.root / "service.key").read_bytes(), fx.old_key_bytes)
+                self.assertEqual(sorted(p.name for p in fx.root.iterdir()), ["home", "new.key", "service", "service-link", "service.key"], "no lock or staging artifact")
+
+    def test_cleanup_is_inside_the_lock(self):
+        fx = self.fixture()
+        holder = self.rekey_holder(fx, "_retire", "after")
+        before = fx.snapshot()
+        self.assert_busy(fx, fx.on("set", "NEW", input=b"new\n"), before)
+        self.assert_ok(holder.resume())
+        self.assert_ok(fx.on("set", "NEW", input=b"new\n"))
+        # A cleanup failure after commit still releases the lock.
+        fx = self.fixture()
+        holder = self.rekey_holder(fx, "_retire", "before")
+        result = holder.resume(b"E")
+        self.assertEqual(result.returncode, 111, result.stderr)
+        self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(fx.root / "new.key"))
+        self.assert_ok(fx.on("set", "NEW", input=b"new\n"))
+        self.assert_get(fx, "TOKEN", SECRET + b"\n")
+
+    def test_writers_exclude_rekey_and_their_results_survive_it(self):
+        cases = {
+            "set": ("_set", ["set", "NEW"], b"new\n", lambda fx: self.assert_get(fx, "NEW", b"new\n")),
+            "set -c": ("_set", ["set", "-c", "NEW"], b"new\n", lambda fx: self.assert_get(fx, "NEW", b"new\n")),
+            "encrypt": ("_transform", ["encrypt", "PLAIN"], None, lambda fx: (self.assertTrue((fx.directory / "PLAIN").read_bytes().startswith(envdirx.MAGIC)), self.assert_get(fx, "PLAIN", b"plain-value\n"))),
+            "decrypt": ("_transform", ["decrypt", "TOKEN"], None, lambda fx: self.assertEqual((fx.directory / "TOKEN").read_bytes(), SECRET + b"\n")),
+            "keygen": ("_keygen", ["keygen", "-k", "fresh.key"], None, None),
+        }
+        for label, (boundary, args, input, check) in cases.items():
+            with self.subTest(label):
+                fx = self.fixture(keyed=label != "keygen")
+                stdin = subprocess.PIPE if input else subprocess.DEVNULL
+                holder = Holder(self, fx, boundary, "before", "-d", fx.directory, *args, stdin=stdin, input=input).ready()
+                before = fx.snapshot()
+                self.assert_busy(fx, fx.on("rekey"), before)
+                self.assert_busy(fx, fx.on("rekey", "-k", fx.root / "new.key", directory=self.parent_alias(fx)), before)
+                self.assert_ok(holder.resume())
+                if label == "keygen":
+                    self.assert_ok(fx.on("set", "-c", "NEW", input=b"new\n"))
+                    check = lambda fx: self.assert_get(fx, "NEW", b"new\n")
+                check(fx)
+                self.assert_ok(fx.on("rekey", "-k", fx.root / "new.key"))
+                self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(fx.root / "new.key"))
+                check(fx)
+
+    def test_set_holds_the_lock_while_reading_stdin(self):
+        for outcome in ("interrupt", "input"):
+            with self.subTest(outcome):
+                fx = self.fixture()
+                holder = Holder(self, fx, "_writer_lock", "", "-d", fx.directory, "set", "-c", "NEW", stdin=subprocess.PIPE).ready()
+                before = fx.snapshot()
+                self.assert_busy(fx, fx.on("rekey"), before)
+                self.assert_busy(fx, fx.on("set", "OTHER", input=b"x"), before)
+                if outcome == "interrupt":
+                    result = holder.signal(signal.SIGINT)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (130, b"", b""))
+                    self.assertEqual(fx.snapshot(), before, "an interrupted set writes nothing")
+                else:
+                    self.assert_ok(holder.resume(command=None, input=b"new\n"))
+                    self.assert_get(fx, "NEW", b"new\n")
+                self.assert_ok(fx.on("rekey", "-k", fx.root / "new.key"))
+                if outcome == "input":
+                    self.assert_get(fx, "NEW", b"new\n")
+
+    def test_signals_release_the_lock_and_keep_a_complete_generation(self):
+        for when in ("before", "after"):
+            for number in (signal.SIGTERM, signal.SIGKILL):
+                with self.subTest(when=when, signal=number.name):
+                    fx = self.fixture()
+                    old_ciphertext = (fx.directory / "TOKEN").read_bytes()
+                    holder = self.rekey_holder(fx, "_exchange", when)
+                    result = holder.signal(number)
+                    self.assertEqual(result.returncode, -number, result.stderr)
+                    key, old = fx.root / "new.key", fx.root / "service.key"
+                    active = old if when == "before" else key
+                    self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(active))
+                    self.assertTrue(key.exists(), "the new key is never deleted")
+                    self.assertEqual(old.read_bytes(), fx.old_key_bytes)
+                    if when == "before":
+                        self.assertEqual((fx.directory / "TOKEN").read_bytes(), old_ciphertext)
+                    self.assert_get(fx, "TOKEN", SECRET + b"\n")
+                    self.assert_get(fx, "PLAIN", b"plain-value\n")
+                    fx.run_ok()
+                    residue = sorted(p for p in fx.root.iterdir() if p.name.startswith(".envdirx-rekey-"))
+                    self.assertEqual(len(residue), 1)
+                    # Admission recovers without deleting the residue.
+                    self.assert_ok(fx.on("set", "NEXT", input=b"next\n"))
+                    self.assert_ok(fx.on("rekey", "-k", fx.root / "newer.key"))
+                    self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(fx.root / "newer.key"))
+                    self.assertTrue(residue[0].is_dir(), "residue is neither adopted nor removed")
+                    self.assertTrue(key.exists())
+                    self.assert_get(fx, "TOKEN", SECRET + b"\n")
+                    self.assert_get(fx, "NEXT", b"next\n")
+
+    def test_handled_failures_release_the_lock(self):
+        cases = {
+            "interrupt before exchange": ("_exchange", "before", b"I", 111, "old"),
+            "I/O error before exchange": ("_exchange", "before", b"E", 111, "old"),
+            "interrupt after exchange": ("_exchange", "after", b"I", 111, "new"),
+            "interrupt in set": ("_set", "before", b"I", 130, None),
+            "I/O error in transform": ("_transform", "before", b"E", 111, None),
+        }
+        for label, (boundary, phase, command, code, active) in cases.items():
+            with self.subTest(label):
+                fx = self.fixture()
+                if boundary == "_exchange":
+                    holder = self.rekey_holder(fx, boundary, phase)
+                else:
+                    args = ["set", "NEW"] if boundary == "_set" else ["encrypt", "--all"]
+                    stdin, input = (subprocess.PIPE, b"new\n") if boundary == "_set" else (subprocess.DEVNULL, None)
+                    holder = Holder(self, fx, boundary, phase, "-d", fx.directory, *args, stdin=stdin, input=input).ready()
+                result = holder.resume(command)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                if active:
+                    key = fx.root / ("service.key" if active == "old" else "new.key")
+                    self.assertEqual(os.readlink(fx.directory / ".envdirx.key"), str(key))
+                self.assertFalse((fx.directory / "NEW").exists())
+                self.assert_ok(fx.on("set", "NEW", input=b"new\n"))
+                self.assert_ok(fx.on("rekey", "-k", fx.root / "newer.key"))
+                self.assert_get(fx, "TOKEN", SECRET + b"\n")
+        # Validation failures inside the lock release it too.
+        fx = self.fixture()
+        self.assertEqual(fx.on("set", ".bad", input=b"x").returncode, 111)
+        self.assertEqual(fx.on("decrypt", "PLAIN").returncode, 111)
+        self.assertEqual(fx.on("rekey", "-k", fx.root / "service.key").returncode, 111)
+        self.assert_ok(fx.on("set", "NEW", input=b"new\n"))
+
+    def test_scope_readers_and_no_artifacts(self):
+        fx = self.fixture()
+        sibling, elsewhere = fx.root / "sibling", fx.root / "elsewhere" / "env"
+        sibling.mkdir()
+        elsewhere.mkdir(parents=True)
+        names = sorted(p.name for p in fx.root.iterdir())
+        holder = Holder(self, fx, "_set", "before", "-d", fx.directory, "set", "NEW", stdin=subprocess.PIPE, input=b"new\n").ready()
+        before = fx.snapshot()
+        self.assert_busy(fx, fx.on("set", "X", input=b"x", directory=sibling), before)
+        self.assert_ok(fx.on("set", "X", input=b"x", directory=elsewhere))
+        self.assert_get(fx, "X", b"x", directory=elsewhere)
+        self.assert_get(fx, "TOKEN", SECRET + b"\n")
+        fx.run_ok()
+        for args in (["--help"], ["-V"], ["-d", fx.directory, "set", "--help"], ["-d", fx.directory, "mkdir"]):
+            self.assertEqual(fx.call(*args).returncode, 0, args)
+        self.assert_ok(holder.resume())
+        self.assert_get(fx, "NEW", b"new\n")
+        self.assert_ok(fx.on("rekey", "-k", fx.root / "new.key"))
+        self.assertEqual(sorted(p.name for p in fx.root.iterdir()), sorted([*names, "new.key"]), "no lock artifact remains")
+        self.assertEqual(sorted(p.name for p in fx.directory.iterdir()), [".envdirx.key", ".envdirx.pub", "NEW", "PLAIN", "TOKEN"])
+
+    def test_disabled_flock_is_a_causal_control(self):
+        """With the holder's flock disabled the same barrier no longer excludes, so passing tests depend on the real lock."""
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled):
+                fx = self.fixture()
+                holder = Holder(self, fx, "_transform", "before", "-d", fx.directory, "encrypt", "PLAIN", disable_flock=disabled).ready()
+                result = fx.on("set", "OTHER", input=b"other")
+                if disabled:
+                    self.assert_ok(result)
+                else:
+                    self.assert_busy(fx, result, fx.snapshot())
+                self.assert_ok(holder.resume())
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    def test_unreadable_parent_fails_closed(self):
+        fx = self.fixture(keyed=False)
+        parent = fx.root / "search-only"
+        envdir = parent / "env"
+        envdir.mkdir(parents=True)
+        parent.chmod(0o311)
+        self.addCleanup(parent.chmod, 0o700)
+        before = fx.snapshot()
+        for args, input in ((["set", "NEW"], b"x"), (["keygen", "-k", fx.root / "k.key"], None), (["rekey"], None), (["encrypt", "--all"], None)):
+            with self.subTest(args[0]):
+                result = fx.on(*args, input=input, directory=envdir)
+                self.assertEqual((result.returncode, result.stdout), (111, b""), result.stderr)
+                self.assertTrue(result.stderr.startswith(b"envdirx: "), result.stderr)
+                self.assertEqual(fx.snapshot(), before)
+                self.assertEqual(os.listdir(envdir), [])
+        self.assertEqual(fx.on("get", "X", directory=envdir).returncode, 111)  # readers are not locked: plain missing entry
+
+
+class WriterLockInProcessTest(unittest.TestCase):
+    """main() wiring: lock errors fail closed before stdin or key reads, and the descriptor never leaks."""
+
+    @staticmethod
+    def fds():
+        return sorted(os.listdir("/dev/fd"))
+
+    def main(self, fx, *args, stdin=None):
+        argv = ["envdirx", "-d", str(fx.directory), *map(str, args)]
+        stderr = io.StringIO()
+        stdin = stdin or mock.Mock()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stderr(stderr), \
+                mock.patch.dict(os.environ, {"HOME": str(fx.home), "XDG_DATA_HOME": str(fx.root / "xdg")}):
+            try:
+                envdirx.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+        return code, stderr.getvalue()
+
+    def test_lock_errors_fail_closed_without_reading(self):
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        commands = (["set", "NEW"], ["set", "-c", "NEW"], ["keygen"], ["encrypt", "--all"], ["decrypt", "--all"], ["rekey"])
+        errors = (OSError(errno.ENOLCK, "No locks available"), BlockingIOError(errno.EWOULDBLOCK, "busy"))
+        for error in errors:
+            for args in commands:
+                with self.subTest(args=args, error=type(error).__name__):
+                    before, fds = fx.snapshot(), self.fds()
+                    stdin = mock.Mock()
+                    with mock.patch.object(envdirx.fcntl, "flock", side_effect=error), mock.patch.object(envdirx, "_private") as private:
+                        code, stderr = self.main(fx, *args, stdin=stdin)
+                    self.assertEqual(code, 111, stderr)
+                    self.assertTrue(stderr.startswith("envdirx: "), stderr)
+                    if isinstance(error, BlockingIOError):
+                        self.assertEqual(stderr, f"envdirx: {envdirx.BUSY}\n")
+                    stdin.buffer.read.assert_not_called()
+                    private.assert_not_called()
+                    self.assertEqual(fx.snapshot(), before)
+                    self.assertEqual(self.fds(), fds, "the lock descriptor is closed")
+
+    def test_descriptor_is_closed_on_success_and_failure(self):
+        fx = Fixture(self)
+        fx.keygen_encrypted()
+        fds = self.fds()
+        stdin = mock.Mock()
+        stdin.buffer.read.return_value = b"v"
+        self.assertEqual(self.main(fx, "set", "NEW", stdin=stdin)[0], 0)
+        self.assertEqual(self.fds(), fds)
+        stdin.buffer.read.side_effect = KeyboardInterrupt
+        self.assertEqual(self.main(fx, "set", "OTHER", stdin=stdin)[0], 130)
+        self.assertEqual(self.fds(), fds)
+        self.assertEqual(self.main(fx, "decrypt", "PLAINLESS")[0], 111)
+        self.assertEqual(self.fds(), fds)
+        self.assertEqual(self.main(fx, "rekey", "-k", fx.root / "new.key")[0], 0)
+        self.assertEqual(self.fds(), fds)
+
+    def test_alias_identity_and_non_inheritance(self):
+        fx = Fixture(self)
+        alias = fx.root / "alias"
+        alias.symlink_to(fx.directory)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        parent_alias = Path(tmp.name) / "parent"
+        parent_alias.symlink_to(fx.root)
+        opened = []
+        real_open = os.open
+
+        def tracking_open(path, flags, *rest):
+            fd = real_open(path, flags, *rest)
+            opened.append(fd)
+            return fd
+
+        before = fx.snapshot()
+        with mock.patch.object(envdirx.os, "open", tracking_open), envdirx._writer_lock(fx.directory) as envdir:
+            self.assertEqual(envdir, fx.directory)
+            self.assertFalse(os.get_inheritable(opened[0]))
+            self.assertEqual(os.fstat(opened[0]).st_ino, fx.root.stat().st_ino)
+            cwd = os.getcwd()
+            try:
+                os.chdir(fx.root)
+                for other in (alias, parent_alias / "service", Path("service"), Path("./alias/../service")):
+                    with self.subTest(other=str(other)), self.assertRaisesRegex(ValueError, "envdir is busy"):
+                        with envdirx._writer_lock(other):
+                            pass
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(fx.snapshot(), before, "locking creates no artifact")
+        with envdirx._writer_lock(alias) as envdir:
+            self.assertEqual(envdir, fx.directory, "the resolved path is yielded")
+
+
+class WriterLockUnitTest(unittest.TestCase):
+    """_writer_lock error mapping and descriptor handling with fake open/flock/close; no real lock is taken."""
+
+    def lock(self, flock=None, open_error=None):
+        directory = mock.Mock()
+        directory.resolve.return_value = Path("/srv/app/env")
+        patches = contextlib.ExitStack()
+        self.addCleanup(patches.close)
+        self.open = patches.enter_context(mock.patch.object(envdirx.os, "open", return_value=42, side_effect=open_error))
+        self.flock = patches.enter_context(mock.patch.object(envdirx.fcntl, "flock", side_effect=flock))
+        self.close = patches.enter_context(mock.patch.object(envdirx.os, "close"))
+        return envdirx._writer_lock(directory)
+
+    def test_success_yields_resolved_and_closes(self):
+        with self.lock() as envdir:
+            self.assertEqual(envdir, Path("/srv/app/env"))
+            self.close.assert_not_called()
+        self.open.assert_called_once_with(Path("/srv/app"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.flock.assert_called_once_with(42, envdirx.fcntl.LOCK_EX | envdirx.fcntl.LOCK_NB)
+        self.close.assert_called_once_with(42)
+
+    def test_body_failure_closes(self):
+        with self.assertRaises(KeyboardInterrupt), self.lock():
+            raise KeyboardInterrupt
+        self.close.assert_called_once_with(42)
+
+    def test_contention_maps_to_busy(self):
+        with self.assertRaisesRegex(ValueError, "^envdir is busy: .*retry"), self.lock(BlockingIOError(errno.EAGAIN, "again")):
+            self.fail("must not be admitted")
+        self.close.assert_called_once_with(42)
+
+    def test_other_flock_errors_propagate(self):
+        with self.assertRaises(OSError) as raised, self.lock(OSError(errno.ENOLCK, "No locks available")):
+            self.fail("must not be admitted")
+        self.assertNotIsInstance(raised.exception, BlockingIOError)
+        self.close.assert_called_once_with(42)
+
+    def test_open_error_propagates_without_flock(self):
+        with self.assertRaises(PermissionError), self.lock(open_error=PermissionError(errno.EACCES, "Permission denied")):
+            self.fail("must not be admitted")
+        self.flock.assert_not_called()
+        self.close.assert_not_called()
 
 
 class NativeExchangeUnitTest(unittest.TestCase):
